@@ -156,7 +156,7 @@ pub struct App {
     pending_open: Option<PathBuf>,
     applied_font: String,
     last_dialog: Option<String>,
-    pending_save: bool,
+    pending_save: Option<String>,
 }
 struct Smoke {
     report: PathBuf,
@@ -259,7 +259,7 @@ impl App {
             pending_open: None,
             applied_font: "__unset__".into(),
             last_dialog: None,
-            pending_save: false,
+            pending_save: None,
         };
         app.restore_drafts();
         app.ensure_focus();
@@ -438,7 +438,7 @@ impl App {
             }
             Action::Theme(id) => self.state.preferences.theme = id,
             Action::Save => {
-                self.pending_save = true;
+                self.pending_save = Some(self.focused.clone());
             }
             Action::Palette => {
                 self.palette = !self.palette;
@@ -817,7 +817,7 @@ if !view.error.is_empty(){ui.colored_label(theme.ui("danger"),&view.error);}let 
     },
     Pane::Editor{path,..}=>{
      if !self.documents.contains_key(&id){match Document::open(path){Ok(doc)=>{self.documents.insert(id.clone(),doc);},Err(e)=>{ui.colored_label(theme.ui("danger"),e.to_string());return;}}}
-     let doc=self.documents.get_mut(&id).unwrap();ui.horizontal(|ui|{if ui.add_enabled(!doc.read_only && doc.dirty(),egui::Button::new("Save  Ctrl+S")).clicked(){self.pending_save=true;}
+     let doc=self.documents.get_mut(&id).unwrap();ui.horizontal(|ui|{if ui.add_enabled(!doc.read_only && doc.dirty(),egui::Button::new("Save  Ctrl+S")).clicked(){self.pending_save=Some(id.clone());}
 if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read only");}ui.label(RichText::new(doc.path.display().to_string()).small());});
      let edit=egui::TextEdit::multiline(&mut doc.text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(!doc.read_only).code_editor();
      egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{if ui.add_sized(ui.available_size().max(Vec2::new(1.,100.)),edit).has_focus(){focus_requested=true;}});
@@ -1637,8 +1637,8 @@ impl eframe::App for App {
             self.open_file(path);
         }
         self.overlays(ctx);
-        if std::mem::take(&mut self.pending_save)
-            && let Some(doc) = self.documents.get_mut(&self.focused)
+        if let Some(id) = self.pending_save.take()
+            && let Some(doc) = self.documents.get_mut(&id)
         {
             self.message = match doc.save() {
                 Ok(()) => "File saved".into(),
