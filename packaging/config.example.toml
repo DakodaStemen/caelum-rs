@@ -1,0 +1,26 @@
+# Caelum configuration: ~/.config/caelum-rs/config.toml
+# Edits are applied while Caelum is running. A file that fails to parse is ignored
+# (the previous settings stay in effect) and the error is shown in the status line.
+# Values set here override the same preferences in the app's JSON profile; the
+# profile (workspace.json) still stores layout and state.
+
+# Id of a bundled or imported theme, e.g. "graphite", "starlight".
+# theme = "graphite"
+
+[font]
+# Fontconfig family name. Leave unset for the system monospace font.
+# family = "JetBrains Mono"
+# size = 15.0          # 6 to 72
+# line_height = 1.2    # 1.0 to 3.0
+
+[cursor]
+# style = "block"      # block | bar | underline
+# blink = false
+
+# Shortcuts are "ctrl+shift+key" style and need ctrl or alt. Actions:
+#   command_palette toggle_sidebar new_tab split_right split_below zoom_pane
+#   close_pane open_file save_file search next_tab prev_tab copy paste
+#   prev_prompt next_prompt
+[keybindings]
+# new_tab = "ctrl+shift+t"
+# prev_prompt = "ctrl+shift+up"

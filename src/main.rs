@@ -7,6 +7,7 @@ fn main() -> Result<()> {
     let mut profile = model::profile();
     let mut import = None;
     let mut smoke = None;
+    let mut config_path = caelum_rs::config::default_path();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -28,6 +29,9 @@ fn main() -> Result<()> {
                     args.next()
                         .context("--import-legacy needs workspace.json")?,
                 ))
+            }
+            "--config" => {
+                config_path = PathBuf::from(args.next().context("--config needs a path")?)
             }
             "--smoke-test" => {
                 smoke = Some(PathBuf::from(
@@ -107,7 +111,16 @@ fn main() -> Result<()> {
     eframe::run_native(
         "io.github.DakodaStemen.CaelumRust",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, profile, state, message, smoke)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                profile,
+                state,
+                message,
+                smoke,
+                config_path,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     if let Some(report) = report {

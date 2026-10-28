@@ -6,6 +6,7 @@ mod sidebar;
 mod terminal_pane;
 use anyhow::{Context, Result, bail};
 use caelum_rs::{
+    config::{self, Config, Keymap},
     files::{self, Document, Draft},
     model::{self, Axis, Pane, State, Tab, Workspace},
     syntax::Highlighter,
@@ -41,6 +42,11 @@ enum Action {
     Save,
     Palette,
     Sidebar,
+    NextTab,
+    PrevTab,
+    Search,
+    Copy,
+    Paste,
 }
 #[derive(Clone)]
 enum PendingClose {
@@ -167,6 +173,10 @@ pub struct App {
     last_dialog: Option<String>,
     pending_save: Option<String>,
     syntax: Highlighter,
+    config_path: PathBuf,
+    config: Config,
+    keymap: Keymap,
+    config_watch: Option<config::Watcher>,
 }
 struct Smoke {
     report: PathBuf,
@@ -186,6 +196,7 @@ impl App {
         mut state: State,
         message: String,
         smoke: Option<PathBuf>,
+        config_path: PathBuf,
     ) -> Self {
         let image = image::load_from_memory(include_bytes!("../../assets/brand/logo.png"))
             .unwrap()
@@ -272,7 +283,19 @@ impl App {
             last_dialog: None,
             pending_save: None,
             syntax: Highlighter::default(),
+            config_path,
+            config: Config::default(),
+            keymap: Keymap::default(),
+            config_watch: None,
         };
+        if app.smoke.is_none() {
+            // Smoke runs use an isolated profile and must not read the user's config.
+            app.reload_config(&cc.egui_ctx, false);
+            match config::Watcher::new(&app.config_path, cc.egui_ctx.clone()) {
+                Ok(w) => app.config_watch = Some(w),
+                Err(e) => app.message = format!("Config watcher unavailable: {e}"),
+            }
+        }
         app.restore_drafts();
         app.ensure_focus();
         app
@@ -328,6 +351,36 @@ impl App {
                 _ => None,
             })
             .unwrap_or_else(model::home)
+    }
+    /// Re-read config.toml. A bad file keeps the previous settings and reports the error.
+    fn reload_config(&mut self, ctx: &egui::Context, announce: bool) {
+        match Config::load(&self.config_path) {
+            Ok(config) => {
+                let keymap = Keymap::build(&config.keybindings).unwrap_or_default();
+                config.apply(&mut self.state.preferences);
+                if let Some(id) = &config.theme {
+                    let known = self.presets.contains_key(id)
+                        || self
+                            .state
+                            .preferences
+                            .custom_themes
+                            .iter()
+                            .any(|t| &t.id == id);
+                    if known {
+                        self.state.preferences.theme = id.clone();
+                    } else {
+                        self.message = format!("config.toml: unknown theme {id:?}");
+                    }
+                }
+                self.keymap = keymap;
+                self.config = config;
+                if announce {
+                    self.message = "Config reloaded".into();
+                }
+                ctx.request_repaint();
+            }
+            Err(e) => self.message = format!("Config not applied: {e:#}"),
+        }
     }
     fn insert(&mut self, pane: Pane) {
         let target = self.focused.clone();
@@ -423,6 +476,29 @@ impl App {
                 self.palette = !self.palette;
                 self.palette_query.clear();
             }
+            Action::NextTab | Action::PrevTab => {
+                let forward = matches!(action, Action::NextTab);
+                let w = self.workspace_mut();
+                let n = w.tabs.len();
+                let i = (w.active_index() + if forward { 1 } else { n - 1 }) % n;
+                w.active_tab = w.tabs[i].id.clone();
+                self.zoom = None;
+                self.ensure_focus();
+            }
+            Action::Search => {
+                self.dialog = Some("Search terminal".into());
+                self.dialog_input.clear();
+            }
+            Action::Copy => {
+                if let Some(text) = self
+                    .terminals
+                    .get(&self.focused)
+                    .and_then(Session::selection)
+                {
+                    ctx.copy_text(text);
+                }
+            }
+            Action::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
         }
         ctx.request_repaint();
     }
@@ -453,54 +529,33 @@ impl App {
         a
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let cs = Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Modifiers::NONE
-        };
-        for (m, key, a) in [
-            (cs, Key::P, Action::Palette),
-            (cs, Key::B, Action::Sidebar),
-            (cs, Key::T, Action::NewTab),
-            (cs, Key::D, Action::Split(Axis::Horizontal)),
-            (cs, Key::E, Action::Split(Axis::Vertical)),
-            (cs, Key::Enter, Action::Zoom),
-            (cs, Key::W, Action::ClosePane),
-            (Modifiers::CTRL, Key::O, Action::Open),
-            (Modifiers::CTRL, Key::S, Action::Save),
-        ] {
-            if ctx.input_mut(|i| i.consume_key(m, key)) {
+        let table = [
+            ("command_palette", Action::Palette),
+            ("toggle_sidebar", Action::Sidebar),
+            ("new_tab", Action::NewTab),
+            ("split_right", Action::Split(Axis::Horizontal)),
+            ("split_below", Action::Split(Axis::Vertical)),
+            ("zoom_pane", Action::Zoom),
+            ("close_pane", Action::ClosePane),
+            ("open_file", Action::Open),
+            ("save_file", Action::Save),
+            ("search", Action::Search),
+            ("next_tab", Action::NextTab),
+            ("prev_tab", Action::PrevTab),
+            ("copy", Action::Copy),
+            ("paste", Action::Paste),
+        ];
+        let mut bound: Vec<_> = table
+            .into_iter()
+            .filter_map(|(name, a)| self.keymap.get(name).map(|b| (b, a)))
+            .collect();
+        // Check combinations with more modifiers first so Ctrl+Shift+Tab is not eaten by Ctrl+Tab.
+        let weight = |m: Modifiers| usize::from(m.ctrl) + usize::from(m.shift) + usize::from(m.alt);
+        bound.sort_by_key(|(b, _)| std::cmp::Reverse(weight(b.modifiers)));
+        for (b, a) in bound {
+            if ctx.input_mut(|i| i.consume_key(b.modifiers, b.key)) {
                 self.action(a, ctx);
             }
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Tab)) {
-            let w = self.workspace_mut();
-            let i = (w.active_index() + 1) % w.tabs.len();
-            w.active_tab = w.tabs[i].id.clone();
-            self.zoom = None;
-            self.ensure_focus();
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::Tab)) {
-            let w = self.workspace_mut();
-            let i = (w.active_index() + w.tabs.len() - 1) % w.tabs.len();
-            w.active_tab = w.tabs[i].id.clone();
-            self.zoom = None;
-            self.ensure_focus();
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::C))
-            && let Some(text) = self
-                .terminals
-                .get(&self.focused)
-                .and_then(Session::selection)
-        {
-            ctx.copy_text(text);
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::V)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::F)) {
-            self.dialog = Some("Search terminal".into());
-            self.dialog_input.clear();
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.palette = false;
@@ -960,6 +1015,15 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
+        }
+        if let Some(w) = &self.config_watch {
+            let mut changed = false;
+            while w.changes.try_recv().is_ok() {
+                changed = true;
+            }
+            if changed {
+                self.reload_config(ctx, true);
+            }
         }
         self.shortcuts(ctx);
         self.apply_font(ctx);
