@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+No release tag has been cut yet; `0.1.0` below is the Cargo version, not a published tag.
+
 - Vibrant syntax highlighting in the editor (Rust, Python, JavaScript, JSON, Markdown, HTML,
   CSS, shell, YAML, TOML and more), colored by each theme's new `syntax` palette.
 - All ten themes rebuilt with richer accents, clearer surfaces and brighter terminal colors.
