@@ -12,9 +12,72 @@ pub fn id() -> String {
     Uuid::new_v4().to_string()
 }
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
+    resolve_home(std::env::var_os("HOME"), passwd_home)
+}
+/// Pure helper: use `env` unless unset/empty, then `passwd`, then `/`.
+fn resolve_home(
+    env: Option<std::ffi::OsString>,
+    passwd: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    env.filter(|h| !h.is_empty())
         .map(PathBuf::from)
+        .or_else(|| passwd().filter(|p| !p.as_os_str().is_empty()))
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+#[cfg(unix)]
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: getpwuid_r writes only into the buffers we provide; pw_dir is read
+    // while buf is alive and copied before returning.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            );
+            if rc == libc::ERANGE && buf.len() < 1 << 20 {
+                let n = buf.len() * 2;
+                buf.resize(n, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+                return None;
+            }
+            let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes().to_vec();
+            return Some(PathBuf::from(std::ffi::OsString::from_vec(dir)));
+        }
+    }
+}
+#[cfg(not(unix))]
+fn passwd_home() -> Option<PathBuf> {
+    None
+}
+/// Creates `path` (and parents); on unix new directories get mode 0700. When
+/// `fix_existing` is set, an already-existing `path` is tightened to 0700 (best effort).
+pub fn create_private_dir(path: &Path, fix_existing: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        if fix_existing {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fix_existing;
+        fs::create_dir_all(path)?;
+    }
+    Ok(())
 }
 pub fn profile() -> PathBuf {
     std::env::var_os("CAELUM_RS_DATA")
@@ -315,8 +378,14 @@ impl State {
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         let parent = path.parent().context("Workspace path has no parent")?;
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent, false)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         temp.write_all(&serde_json::to_vec_pretty(self)?)?;
         temp.as_file().sync_all()?;
         temp.persist(path)?;
@@ -370,6 +439,41 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_and_workspace_file_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("a/profile");
+        create_private_dir(&profile, true).unwrap();
+        assert_eq!(fs::metadata(&profile).unwrap().mode() & 0o777, 0o700);
+        let file = profile.join("workspace.json");
+        State::default().save(&file).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        // Re-saving over an existing file keeps 0600.
+        State::default().save(&file).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        // Existing loose dir is tightened when requested.
+        let loose = d.path().join("loose");
+        fs::create_dir(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&loose, false).unwrap();
+        assert_eq!(fs::metadata(&loose).unwrap().mode() & 0o777, 0o755);
+        create_private_dir(&loose, true).unwrap();
+        assert_eq!(fs::metadata(&loose).unwrap().mode() & 0o777, 0o700);
+    }
+    #[test]
+    fn home_fallback_order() {
+        let pw = || Some(PathBuf::from("/home/pw"));
+        assert_eq!(resolve_home(Some("/h".into()), pw), PathBuf::from("/h"));
+        assert_eq!(resolve_home(Some("".into()), pw), PathBuf::from("/home/pw"));
+        assert_eq!(resolve_home(None, pw), PathBuf::from("/home/pw"));
+        assert_eq!(resolve_home(None, || None), PathBuf::from("/"));
+        assert_eq!(
+            resolve_home(Some("".into()), || Some(PathBuf::new())),
+            PathBuf::from("/")
+        );
+    }
     #[test]
     fn nested_layout_collapses_without_losing_sibling() {
         let mut p = Pane::terminal(home());
