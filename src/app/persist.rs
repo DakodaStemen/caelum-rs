@@ -1,5 +1,35 @@
 use super::*;
 
+/// Restricts a profile file to the owner on unix; a no-op elsewhere.
+fn restrict(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Copies `source` to `backup`, creating the backup owner-only (0600) on unix.
+fn copy_private(source: &Path, backup: &Path) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut input = fs::File::open(source)?;
+    let mut output = options.open(backup)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    restrict(backup)
+}
+
 impl App {
     pub(super) fn persist(&mut self) {
         fn sync_cwd(p: &mut Pane, sessions: &HashMap<String, Session>) {
@@ -28,8 +58,8 @@ impl App {
                 .unwrap_or_default()
                 .as_nanos();
             let backup = self.profile.join(format!("drafts-conflict-{stamp}.json"));
-            match fs::copy(&source, &backup) {
-                Ok(_) => {
+            match copy_private(&source, &backup) {
+                Ok(()) => {
                     self.recovery_conflict = false;
                     self.message =
                         format!("Conflicting recovery preserved at {}", backup.display());
@@ -45,6 +75,9 @@ impl App {
             self.message = format!("Workspace was not saved: {e}");
             return;
         }
+        if let Err(e) = restrict(&self.profile.join("workspace.json")) {
+            self.message = format!("Workspace permissions were not restricted: {e}");
+        }
         if !self.recovery_conflict {
             let drafts: Vec<_> = self
                 .documents
@@ -55,6 +88,7 @@ impl App {
             let result = (|| -> Result<()> {
                 let mut temp = tempfile::NamedTempFile::new_in(&self.profile)?;
                 temp.write_all(&serde_json::to_vec_pretty(&drafts)?)?;
+                restrict(temp.path())?;
                 temp.as_file().sync_all()?;
                 temp.persist(self.profile.join("drafts.json"))?;
                 Ok(())
