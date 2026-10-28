@@ -4,6 +4,8 @@
 
 - Vibrant syntax highlighting in the editor (Rust, Python, JavaScript, JSON, Markdown, HTML,
   CSS, shell, YAML, TOML and more), colored by each theme's new `syntax` palette.
+- The custom theme editor now includes the code (syntax) colors, listed first.
+- Orbit is the new default theme.
 - All ten themes rebuilt with richer accents, clearer surfaces and brighter terminal colors.
 - Interface overhaul: breadcrumb header, command-search pill, sidebar rows with hints and an
   active marker, tab chips with inline close, focus-aware pane headers, rounded controls,

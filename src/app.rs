@@ -1113,9 +1113,11 @@ if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read o
                                 ui.selectable_value(&mut t.kind, "light".into(), "Light");
                             });
                         ui.separator();
-                        for (name, values) in
-                            [("Interface", &mut t.ui), ("Terminal", &mut t.terminal)]
-                        {
+                        for (name, values) in [
+                            ("Code", &mut t.syntax),
+                            ("Interface", &mut t.ui),
+                            ("Terminal", &mut t.terminal),
+                        ] {
                             ui.strong(name);
                             egui::Grid::new(name).num_columns(2).show(ui, |ui| {
                                 for (key, value) in values {

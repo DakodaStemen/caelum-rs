@@ -370,6 +370,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     Ok(())
 }
 /// Plays a paced session for README recording; run under Xvfb with `ffmpeg -f x11grab` capturing.
+const DEMO_CUSTOMIZE: (i16, i16) = (510, 425);
 #[test]
 #[ignore = "demo recording: scripts/record-demo.sh"]
 fn record_demo() -> Result<()> {
@@ -479,6 +480,17 @@ fn main() {
     for name in ["Aurora", "Dawn", "Orbit"] {
         theme(name, 1600)?;
     }
+    // Quick look at custom themes: open Appearance, then start a customised copy.
+    k.shortcut('p' as u32)?;
+    pause(500);
+    k.type_text("Appearance")?;
+    pause(600);
+    k.press(0xff0d)?;
+    pause(2200);
+    k.click(DEMO_CUSTOMIZE.0, DEMO_CUSTOMIZE.1)?;
+    pause(2800);
+    k.press(0xff1b)?;
+    pause(1000);
     // Edit in the pane: add a comment, then save with the pane's own Save button.
     let geometry = k.connection.get_geometry(k.window)?.reply()?;
     let width = geometry.width as i16;
