@@ -595,6 +595,22 @@ pub fn show(
             Side::Left,
         ));
     }
+    if focused && !ui.ctx().wants_keyboard_input() {
+        response.request_focus();
+    }
+    if response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
+    }
     if response.clicked() || response.drag_started() {
         response.request_focus();
     }

@@ -11,7 +11,8 @@ Checked on Linux on 2026-10-28:
   splits, zoom, tabs, persistence, editor save/conflict behavior, system/process
   data and light/dark themes. The PNG in this directory is from this native app.
 - An XTest integration test on an isolated Xvfb display: real keyboard input,
-  Ctrl+C interrupting a running process, typing into a new split, tab creation,
+  Ctrl+C interrupting a running process, Tab retaining terminal focus, Vim editing,
+  typing into a new split, tab creation,
   native editor typing and saving, graceful shutdown, and restarting the saved layout.
 - The initial in-app smoke checks also ran on the local Wayland desktop.
 

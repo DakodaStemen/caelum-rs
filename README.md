@@ -39,6 +39,10 @@ Linux is the current target. Install a stable Rust toolchain, a C linker and the
 usual X11/Wayland and OpenGL runtime libraries. Fontconfig is used to locate a
 system monospace font; bundled font fallbacks remain available.
 
+On Ubuntu, the runtime packages include `libxkbcommon-x11-0`, `libx11-6`,
+`libwayland-client0`, `libegl1`, `libgl1` and `fontconfig`. On Arch, install
+`libxkbcommon-x11`, `libx11`, `wayland`, `mesa` and `fontconfig`.
+
 ```sh
 git clone https://github.com/DakodaStemen/caelum-rs.git
 cd caelum-rs

@@ -11,14 +11,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig vim-tiny
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: xvfb-run -a cargo test --locked --test desktop -- --ignored --nocapture
+      - run: xvfb-run -a -s "-screen 0 1600x1000x24" cargo test --locked --test desktop -- --ignored --nocapture
       - run: |
           mkdir -p .runtime
-          xvfb-run -a cargo run --locked -- --smoke-test "$PWD/.runtime/desktop.json"
+          xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --locked -- --smoke-test "$PWD/.runtime/desktop.json"
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
       - uses: actions/upload-artifact@v4

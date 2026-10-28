@@ -155,6 +155,7 @@ pub struct App {
     recovery_conflict: bool,
     pending_open: Option<PathBuf>,
     applied_font: String,
+    last_dialog: Option<String>,
 }
 struct Smoke {
     report: PathBuf,
@@ -256,6 +257,7 @@ impl App {
             recovery_conflict: false,
             pending_open: None,
             applied_font: "__unset__".into(),
+            last_dialog: None,
         };
         app.restore_drafts();
         app.ensure_focus();
@@ -362,6 +364,19 @@ impl App {
         self.zoom = None;
     }
     fn action(&mut self, action: Action, ctx: &egui::Context) {
+        let reset_focus = matches!(
+            &action,
+            Action::NewTab
+                | Action::NewWorkspace
+                | Action::Split(_)
+                | Action::Assistant(_)
+                | Action::Palette
+                | Action::Open
+                | Action::Connect
+        );
+        if reset_focus {
+            ctx.memory_mut(|m| m.stop_text_input());
+        }
         match action {
             Action::NewTab => {
                 let t = Tab::new(self.cwd());
@@ -831,6 +846,10 @@ if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read o
         }
     }
     fn overlays(&mut self, ctx: &egui::Context) {
+        if self.dialog != self.last_dialog {
+            ctx.memory_mut(|m| m.stop_text_input());
+            self.last_dialog = self.dialog.clone();
+        }
         if self.palette {
             let mut action = None;
             egui::Window::new("Command palette")

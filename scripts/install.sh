@@ -24,7 +24,7 @@ Comment=Native Rust workspace terminal
 Exec="$escaped_binary"
 Icon=caelum-rs
 Terminal=false
-Categories=System;TerminalEmulator;Development;
+Categories=System;TerminalEmulator;
 StartupWMClass=io.github.DakodaStemen.CaelumRust
 DESKTOP
 if command -v update-desktop-database >/dev/null; then update-desktop-database "$HOME/.local/share/applications"; fi

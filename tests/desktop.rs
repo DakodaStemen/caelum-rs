@@ -221,6 +221,31 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     wait(|| canceled.exists())?;
     // A real keyboard shortcut creates a split and focuses its new terminal.
     eprintln!("ctrl-c passed");
+    let tab_marker = dir.path().join("tab_marker");
+    keyboard.type_text(&format!("printf tab_ok > {}", tab_marker.display()))?;
+    keyboard.press(0xff09)?;
+    keyboard.press(0xff0d)?;
+    wait(|| tab_marker.exists()).context("Terminal Tab must not move UI focus")?;
+    if Command::new("vim")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let tui_file = dir.path().join("vim.txt");
+        keyboard.type_text(&format!("vim -Nu NONE -i NONE -n {}", tui_file.display()))?;
+        keyboard.press(0xff0d)?;
+        thread::sleep(Duration::from_millis(600));
+        keyboard.type_text("inative_tui_ok")?;
+        keyboard.press(0xff1b)?;
+        thread::sleep(Duration::from_millis(100));
+        keyboard.type_text(":wq")?;
+        keyboard.press(0xff0d)?;
+        wait(|| fs::read_to_string(&tui_file).ok().as_deref() == Some("native_tui_ok\n"))
+            .context("Native terminal Vim editing")?;
+    }
+
     keyboard.shortcut('d' as u32)?;
     let split = dir.path().join("split");
     keyboard.type_text(&format!("printf split_ok > {}", split.display()))?;
