@@ -15,7 +15,7 @@ DISPLAY=$D ffmpeg -loglevel error -y -f x11grab -framerate 15 -video_size 1360x8
   -t 75 .runtime/demo.mp4 &
 FPID=$!
 sleep 1
-DISPLAY=$D WAYLAND_DISPLAY= cargo test --locked --test desktop -- --ignored record_demo
+CAELUM_RECORD_DEMO=1 DISPLAY=$D WAYLAND_DISPLAY= cargo test --locked --test desktop -- --ignored record_demo
 kill -INT $FPID 2>/dev/null || true
 wait $FPID 2>/dev/null || true
 ffmpeg -loglevel error -y -i .runtime/demo.mp4 \

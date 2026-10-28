@@ -373,6 +373,10 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
 #[test]
 #[ignore = "demo recording: scripts/record-demo.sh"]
 fn record_demo() -> Result<()> {
+    // Shares the display with the input test, so only play it when the recorder asks.
+    if std::env::var_os("CAELUM_RECORD_DEMO").is_none() {
+        return Ok(());
+    }
     let dir = tempfile::tempdir()?;
     let profile = dir.path().join("profile");
     fs::create_dir(&profile)?;
