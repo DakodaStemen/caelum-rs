@@ -3,7 +3,7 @@
 Checked on Linux on 2026-10-28:
 
 - Rust formatting and Clippy with warnings denied.
-- 17 Rust regression/integration tests: layout persistence, duplicate-ID rejection,
+- 20 Rust unit/regression tests (`cargo test --locked`; two further desktop tests are `#[ignore]`d and run under Xvfb): layout persistence, duplicate-ID rejection,
   legacy browser/SSH import, themes, safe file saves, encoding preservation,
   unsaved draft recovery, PTY output and resize, ANSI true color and wide cells,
   alternate-screen restoration, history search, burst-input retention and owned process-group shutdown.
