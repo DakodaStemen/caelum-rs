@@ -1,5 +1,9 @@
 //! PTY ownership, terminal emulation and input translation. The UI never blocks on PTY I/O.
-use crate::{model::Preferences, theme::Theme};
+use crate::{
+    model::Preferences,
+    osc::{OscEvent, OscScanner},
+    theme::Theme,
+};
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
@@ -47,12 +51,61 @@ impl Dimensions for Size {
         self.cols
     }
 }
+/// Shell-reported state from OSC 7 / OSC 133, shared with the PTY reader thread.
+#[derive(Default, Debug)]
+pub struct ShellState {
+    /// Last OSC 7 working directory for this host.
+    pub cwd: Option<PathBuf>,
+    /// Prompt starts as absolute line indexes (0 = oldest scrollback line).
+    marks: Vec<i64>,
+    /// Exit status of the most recent finished command, if the shell reported one.
+    pub last_exit: Option<i32>,
+    /// True between OSC 133;C and OSC 133;D.
+    pub running: bool,
+    last_history: usize,
+}
+impl ShellState {
+    fn clear_marks(&mut self) {
+        self.marks.clear();
+    }
+}
+fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
+    match event {
+        OscEvent::Cwd(path) => shell.cwd = Some(path),
+        OscEvent::PromptStart => {
+            // Marks are only meaningful on the primary screen.
+            if term.mode().contains(TermMode::ALT_SCREEN) {
+                return;
+            }
+            let abs =
+                term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0);
+            if shell.marks.last() != Some(&abs) {
+                shell.marks.push(abs);
+            }
+        }
+        OscEvent::OutputStart => shell.running = true,
+        OscEvent::CommandEnd(code) => {
+            shell.running = false;
+            shell.last_exit = code;
+        }
+    }
+}
+/// Absolute indexes drift once Alacritty starts discarding old scrollback, so marks
+/// are dropped when history is truncated or full instead of pointing at wrong lines.
+fn reconcile_marks(term: &Term<Events>, shell: &mut ShellState) {
+    let history = term.grid().history_size();
+    if history < shell.last_history || history >= Config::default().scrolling_history {
+        shell.clear_marks();
+    }
+    shell.last_history = history;
+}
 pub struct Session {
     pub term: Arc<Mutex<Term<Events>>>,
     pub title: String,
     pub cwd: PathBuf,
     pub exited: bool,
     pub error: Option<String>,
+    pub shell: Arc<Mutex<ShellState>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     input: Option<SyncSender<Vec<u8>>>,
@@ -94,6 +147,8 @@ impl Session {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Caelum Rust");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // Lets shell rc files enable the integration only inside Caelum.
+        cmd.env("CAELUM_RS", env!("CARGO_PKG_VERSION"));
         // Nonblocking descriptors let both workers honor shutdown even if a descendant holds the PTY open.
         #[cfg(unix)]
         if let Some(fd) = pair.master.as_raw_fd() {
@@ -119,16 +174,28 @@ impl Session {
         let read_stop = stop.clone();
         let read_term = term.clone();
         let read_ctx = ctx.clone();
+        let shell = Arc::new(Mutex::new(ShellState::default()));
+        let read_shell = shell.clone();
         let read_thread = thread::spawn(move || {
             let mut parser: ansi::Processor = ansi::Processor::new();
+            let mut scanner = OscScanner::default();
             let mut bytes = [0; 16384];
             while !read_stop.load(Ordering::Relaxed) {
                 match reader.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(n) => {
                         {
+                            let events = scanner.scan(&bytes[..n]);
                             let mut t = lock(&read_term);
-                            parser.advance(&mut *t, &bytes[..n]);
+                            let mut shell = lock(&read_shell);
+                            let mut done = 0;
+                            for (end, event) in events {
+                                parser.advance(&mut *t, &bytes[done..end]);
+                                done = end;
+                                apply_osc(&t, &mut shell, event);
+                            }
+                            parser.advance(&mut *t, &bytes[done..n]);
+                            reconcile_marks(&t, &mut shell);
                         }
                         read_ctx.request_repaint();
                     }
@@ -170,6 +237,7 @@ impl Session {
             cwd,
             exited: false,
             error: None,
+            shell,
             master: pair.master,
             child,
             input: Some(input),
@@ -259,12 +327,19 @@ impl Session {
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
-        #[cfg(target_os = "linux")]
-        if let Some(pid) = self.child.process_id()
-            && !self.exited
-            && let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
-        {
+        // A shell-reported OSC 7 directory wins; /proc is the fallback for shells
+        // without integration (it only sees the process we spawned, not subshells).
+        let reported = lock(&self.shell).cwd.clone().filter(|p| p.is_dir());
+        if let Some(cwd) = reported {
             self.cwd = cwd;
+        } else {
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = self.child.process_id()
+                && !self.exited
+                && let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            {
+                self.cwd = cwd;
+            }
         }
     }
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -283,6 +358,10 @@ impl Session {
         }) {
             self.error = Some(e.to_string());
             return;
+        }
+        if self.size.cols != size.cols {
+            // Reflow changes line counts, so stored line positions are no longer valid.
+            lock(&self.shell).clear_marks();
         }
         lock(&self.term).resize(size);
         self.size = size;
@@ -374,6 +453,33 @@ impl Session {
             true
         } else {
             false
+        }
+    }
+    /// Scroll to the previous/next shell prompt (needs OSC 133 integration).
+    /// Returns false when there is no such prompt.
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        let mut term = lock(&self.term);
+        let shell = lock(&self.shell);
+        let history = term.grid().history_size() as i64;
+        let top = -(term.grid().display_offset() as i64);
+        let lines = shell.marks.iter().map(|abs| abs - history);
+        let target = if forward {
+            lines.filter(|l| *l > top).min()
+        } else {
+            lines.filter(|l| *l < top).max()
+        };
+        match target {
+            Some(line) => {
+                let offset = (-line).clamp(0, history) as i32;
+                term.scroll_display(Scroll::Bottom);
+                term.scroll_display(Scroll::Delta(offset));
+                true
+            }
+            None if forward => {
+                term.scroll_display(Scroll::Bottom);
+                false
+            }
+            None => false,
         }
     }
     pub fn selection(&self) -> Option<String> {
@@ -718,6 +824,14 @@ pub fn show(
                         });
                         continue;
                     }
+                    if modifiers.ctrl
+                        && modifiers.shift
+                        && matches!(key, Key::ArrowUp | Key::ArrowDown)
+                    {
+                        // Needs OSC 133 shell integration; silently a no-op otherwise.
+                        s.jump_prompt(key == Key::ArrowDown);
+                        continue;
+                    }
                     if !(modifiers.ctrl && modifiers.shift)
                         && let Some(bytes) = key_bytes(key, modifiers, mode)
                     {
@@ -871,6 +985,28 @@ pub fn show(
         }
     }
     drop(term);
+    {
+        let shell = lock(&s.shell);
+        if let Some(code) = shell.last_exit.filter(|c| *c != 0 && !shell.running) {
+            let galley = painter.layout_no_wrap(
+                format!("exit {code}"),
+                FontId::monospace(prefs.font_size * 0.8),
+                theme.ui("danger"),
+            );
+            let badge = Rect::from_min_size(
+                Pos2::new(rect.right() - galley.size().x - 14., rect.top() + 4.),
+                galley.size() + Vec2::new(10., 4.),
+            );
+            painter.rect_filled(badge, 4., theme.term("background").gamma_multiply(0.85));
+            painter.rect_stroke(
+                badge,
+                4.,
+                Stroke::new(1_f32, theme.ui("danger")),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(badge.min + Vec2::new(5., 2.), galley, theme.ui("danger"));
+        }
+    }
     response.context_menu(|ui| {
         if ui.button("Copy selection").clicked() {
             if let Some(text) = s.selection() {
