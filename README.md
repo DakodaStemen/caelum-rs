@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/mark-dark.svg">
-    <img src="assets/brand/mark.svg" width="180" alt="Caelum icon">
+    <img src="assets/brand/mark.svg" width="96" alt="Caelum icon">
   </picture>
 </p>
 
@@ -132,5 +132,5 @@ does not establish accessibility of terminal content.
 ## License
 
 [MIT](LICENSE). Third-party crates retain their own licenses; see
-[third-party notices](THIRD_PARTY_NOTICES.md). The icon is the supplied Caelum SVG
-with its lettering removed; a heavier rendering is used at small app-icon sizes.
+[third-party notices](THIRD_PARTY_NOTICES.md). The icon is a clean SVG redraw of the supplied Caelum mark
+without lettering; a heavier rendering is used at small app-icon sizes.

@@ -384,7 +384,11 @@ fn record_demo() -> Result<()> {
     let shell = dir.path().join("shell");
     fs::write(
         &shell,
-        "#!/bin/sh\nexport HISTFILE=/dev/null PS1='\\033[35m❯\\033[0m '\nexec /bin/bash --noprofile --norc -i\n",
+        // Ubuntu-style prompt with a fixed fake identity, so no real user or host leaks.
+        r#"#!/bin/sh
+export HISTFILE=/dev/null PS1='\[\033[01;32m\]dev@caelum\[\033[00m\]:\[\033[01;34m\]~/caelum-rs\[\033[00m\]\$ '
+exec /bin/bash --noprofile --norc -i
+"#,
     )?;
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700))?;

@@ -3,13 +3,13 @@
 Checked on Linux on 2026-10-28:
 
 - Rust formatting and Clippy with warnings denied.
-- 17 Rust regression/integration tests: layout persistence, duplicate-ID rejection,
+- 44 Rust unit, regression and headless integration tests (24 unit, 20 in tests/headless.rs) (`cargo test --locked`; two further desktop tests are `#[ignore]`d and run under Xvfb): layout persistence, duplicate-ID rejection,
   legacy browser/SSH import, themes, safe file saves, encoding preservation,
   unsaved draft recovery, PTY output and resize, ANSI true color and wide cells,
   alternate-screen restoration, history search, burst-input retention and owned process-group shutdown.
 - Nine in-app desktop checks in an isolated profile: real shell execution,
   splits, zoom, tabs, persistence, editor save/conflict behavior, system/process
-  data and light/dark themes. The PNG in this directory is from this native app.
+  data and light/dark themes.
 - An XTest integration test on an isolated Xvfb display: real keyboard input,
   Ctrl+C interrupting a running process, Tab retaining terminal focus, Vim editing,
   typing into a new split, tab creation,
