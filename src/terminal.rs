@@ -8,6 +8,7 @@ use alacritty_terminal::{
     term::{Config, Term, TermMode},
     vte::ansi::{self, Color, NamedColor},
 };
+#[cfg_attr(not(unix), allow(unused_imports))]
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
@@ -889,6 +890,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
     #[test]
     fn key_modes_and_control() {
@@ -953,6 +955,7 @@ mod tests {
 mod regressions {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
     #[test]
     fn parser_preserves_truecolor_wide_cells_and_alternate_screen() {
@@ -1006,7 +1009,7 @@ mod regressions {
         assert!(s.term.lock().unwrap().grid().display_offset() > 0);
         assert_eq!(s.selection().as_deref(), Some("line-5"));
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")] // inspects /proc
     #[test]
     fn closing_session_stops_foreground_even_when_hangup_is_ignored() {
         let argv = [
@@ -1048,7 +1051,7 @@ mod regressions {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod input_queue_tests {
     use super::*;
     use std::time::Instant;
@@ -1065,7 +1068,7 @@ mod input_queue_tests {
             "--norc".into(),
         ];
         let mut s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
-        let text = "x".repeat(1000);
+        let text = "x".repeat(if cfg!(target_os = "linux") { 1000 } else { 300 });
         let command = format!("printf '%s' '{text}' > {}\r", file.display());
         for byte in command.bytes() {
             s.write(vec![byte]);
