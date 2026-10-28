@@ -15,7 +15,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -78,7 +78,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let shell = resolve_shell(std::env::var("SHELL").ok().as_deref());
         let mut cmd = if let Some(argv) = argv {
             let first = argv.first().context("Empty terminal command")?;
             let mut c = CommandBuilder::new(first);
@@ -126,7 +126,8 @@ impl Session {
                 match reader.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(mut t) = read_term.lock() {
+                        {
+                            let mut t = lock(&read_term);
                             parser.advance(&mut *t, &bytes[..n]);
                         }
                         read_ctx.request_repaint();
@@ -212,12 +213,7 @@ impl Session {
         }
     }
     pub fn paste(&mut self, text: &str) {
-        let bracketed = self
-            .term
-            .lock()
-            .unwrap()
-            .mode()
-            .contains(TermMode::BRACKETED_PASTE);
+        let bracketed = lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE);
         let text = text.replace('\x1b', "");
         let bytes = if bracketed {
             format!("\x1b[200~{text}\x1b[201~").into_bytes()
@@ -288,11 +284,11 @@ impl Session {
             self.error = Some(e.to_string());
             return;
         }
-        self.term.lock().unwrap().resize(size);
+        lock(&self.term).resize(size);
         self.size = size;
     }
     pub fn text(&self) -> String {
-        let term = self.term.lock().unwrap();
+        let term = lock(&self.term);
         let mut text = String::new();
         for row in 0..term.screen_lines() {
             for col in 0..term.columns() {
@@ -326,7 +322,7 @@ impl Session {
         let Ok(mut regex) = RegexSearch::new(&escaped) else {
             return false;
         };
-        let mut term = self.term.lock().unwrap();
+        let mut term = lock(&self.term);
         let mut origin = self
             .search_origin
             .as_ref()
@@ -381,7 +377,7 @@ impl Session {
         }
     }
     pub fn selection(&self) -> Option<String> {
-        self.term.lock().unwrap().selection_to_string()
+        lock(&self.term).selection_to_string()
     }
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
@@ -589,17 +585,16 @@ pub fn show(
             ),
         )
     };
-    let offset = s.term.lock().unwrap().grid().display_offset();
-    let mouse_reporting =
-        s.term.lock().unwrap().mode().intersects(
-            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
-        );
+    let offset = lock(&s.term).grid().display_offset();
+    let mouse_reporting = lock(&s.term)
+        .mode()
+        .intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION);
     let selecting = !mouse_reporting || ui.input(|i| i.modifiers.shift);
     if response.drag_started()
         && selecting
         && let Some(pos) = response.interact_pointer_pos()
     {
-        s.term.lock().unwrap().selection = Some(Selection::new(
+        lock(&s.term).selection = Some(Selection::new(
             SelectionType::Simple,
             point_at(pos, offset),
             Side::Left,
@@ -608,7 +603,7 @@ pub fn show(
     if response.dragged()
         && selecting
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some(selection) = &mut s.term.lock().unwrap().selection
+        && let Some(selection) = &mut lock(&s.term).selection
     {
         selection.update(point_at(pos, offset), Side::Right);
     }
@@ -616,7 +611,7 @@ pub fn show(
         && selecting
         && let Some(pos) = response.interact_pointer_pos()
     {
-        s.term.lock().unwrap().selection = Some(Selection::new(
+        lock(&s.term).selection = Some(Selection::new(
             SelectionType::Semantic,
             point_at(pos, offset),
             Side::Left,
@@ -646,7 +641,7 @@ pub fn show(
         && ui.input(|i| i.modifiers.ctrl)
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let term = s.term.lock().unwrap();
+        let term = lock(&s.term);
         if let Some(link) = term.grid()[point_at(pos, offset)].hyperlink() {
             let url = link.uri();
             if url.starts_with("https://") || url.starts_with("http://") {
@@ -655,7 +650,7 @@ pub fn show(
         }
     }
     if response.clicked() && !ui.input(|i| i.modifiers.ctrl) && selecting {
-        s.term.lock().unwrap().selection = None;
+        lock(&s.term).selection = None;
     }
     if response.hovered() {
         let delta = ui.input(|i| i.raw_scroll_delta.y);
@@ -674,15 +669,12 @@ pub fn show(
                     );
                 }
             } else {
-                s.term
-                    .lock()
-                    .unwrap()
-                    .scroll_display(Scroll::Delta((delta / 12.).round() as i32));
+                lock(&s.term).scroll_display(Scroll::Delta((delta / 12.).round() as i32));
             }
         }
     }
     if focused && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
-        let mode = *s.term.lock().unwrap().mode();
+        let mode = *lock(&s.term).mode();
         let events = ui.input(|i| i.events.clone());
         for event in events {
             match event {
@@ -694,7 +686,7 @@ pub fn show(
                             text
                         };
                         s.write(text.into_bytes());
-                        s.term.lock().unwrap().scroll_display(Scroll::Bottom);
+                        lock(&s.term).scroll_display(Scroll::Bottom);
                     }
                 }
                 egui::Event::Copy => {
@@ -718,7 +710,7 @@ pub fn show(
                         && !modifiers.ctrl
                         && matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End)
                     {
-                        s.term.lock().unwrap().scroll_display(match key {
+                        lock(&s.term).scroll_display(match key {
                             Key::PageUp => Scroll::PageUp,
                             Key::PageDown => Scroll::PageDown,
                             Key::Home => Scroll::Top,
@@ -730,7 +722,7 @@ pub fn show(
                         && let Some(bytes) = key_bytes(key, modifiers, mode)
                     {
                         s.write(bytes);
-                        s.term.lock().unwrap().scroll_display(Scroll::Bottom);
+                        lock(&s.term).scroll_display(Scroll::Bottom);
                     }
                 }
                 egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
@@ -760,7 +752,7 @@ pub fn show(
             }
         }
     }
-    let term = s.term.lock().unwrap();
+    let term = lock(&s.term);
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
     let selection = content.selection;
@@ -892,13 +884,38 @@ pub fn show(
             ui.close();
         }
         if ui.button("Scroll to bottom").clicked() {
-            s.term.lock().unwrap().scroll_display(Scroll::Bottom);
+            lock(&s.term).scroll_display(Scroll::Bottom);
             ui.close();
         }
         clicked = true;
     });
     clicked
 }
+
+/// Lock a mutex, recovering the guard if a previous holder panicked.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+const DEFAULT_SHELL: &str = "/bin/bash";
+
+/// Pick a usable shell: `candidate` must be an absolute path to an executable file.
+fn resolve_shell(candidate: Option<&str>) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    match candidate {
+        Some(c)
+            if !c.is_empty()
+                && Path::new(c).is_absolute()
+                && std::fs::metadata(c)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false) =>
+        {
+            c.to_string()
+        }
+        _ => DEFAULT_SHELL.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1105,39 @@ mod input_queue_tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("Input was lost: {:?}", s.error);
+    }
+}
+
+#[cfg(test)]
+mod lock_shell_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_mutex_still_usable() {
+        let m = Arc::new(Mutex::new(5));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        *lock(&m) += 1;
+        assert_eq!(*lock(&m), 6);
+    }
+
+    #[test]
+    fn bad_shell_falls_back() {
+        for bad in [
+            None,
+            Some(""),
+            Some("bash"),
+            Some("./sh"),
+            Some("/nonexistent/shell"),
+            Some("/tmp"),
+        ] {
+            assert_eq!(resolve_shell(bad), DEFAULT_SHELL, "{bad:?}");
+        }
+        assert_eq!(resolve_shell(Some("/bin/sh")), "/bin/sh");
     }
 }
