@@ -77,13 +77,13 @@
       "danger": "#ff6e7f"
     },
     "terminal": {
-      "background": "#0b171c",
-      "foreground": "#e0e8eb",
+      "background": "#000000",
+      "foreground": "#d0d0d0",
       "cursor": "#4fd8ff",
       "selectionBackground": "#4fd8ff55",
       "black": "#1a2f37",
       "red": "#ff6e7f",
-      "green": "#5eead4",
+      "green": "#4ade80",
       "yellow": "#ffd35a",
       "blue": "#4da3ff",
       "magenta": "#9d8cff",
