@@ -389,7 +389,7 @@ fn record_demo() -> Result<()> {
     let mut state = caelum_rs::model::State::default();
     state.workspaces[0].tabs[0].layout = caelum_rs::model::Pane::terminal(work.clone());
     state.save(&profile.join("workspace.json"))?;
-    let mut app = AppChild(
+    let app = AppChild(
         Command::new(env!("CARGO_BIN_EXE_caelum-rs"))
             .args(["--data-dir", profile.to_str().unwrap()])
             .env_remove("WAYLAND_DISPLAY")
