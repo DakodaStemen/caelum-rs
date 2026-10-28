@@ -28,10 +28,8 @@ impl App {
         let doc = self.documents.get_mut(id).unwrap();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(
-                    !doc.read_only && doc.dirty(),
-                    egui::Button::new("Save  Ctrl+S"),
-                )
+                .add_enabled(!doc.read_only && doc.dirty(), egui::Button::new("Save"))
+                .on_hover_text("Ctrl+S")
                 .clicked()
             {
                 self.pending_save = Some(id.to_string());

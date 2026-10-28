@@ -9,7 +9,7 @@ Checked on Linux on 2026-10-28:
   alternate-screen restoration, history search, burst-input retention and owned process-group shutdown.
 - Nine in-app desktop checks in an isolated profile: real shell execution,
   splits, zoom, tabs, persistence, editor save/conflict behavior, system/process
-  data and light/dark themes. The PNG in this directory is from this native app.
+  data and light/dark themes.
 - An XTest integration test on an isolated Xvfb display: real keyboard input,
   Ctrl+C interrupting a running process, Tab retaining terminal focus, Vim editing,
   typing into a new split, tab creation,
