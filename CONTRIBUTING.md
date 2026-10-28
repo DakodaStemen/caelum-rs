@@ -11,5 +11,5 @@ performance improvements from language choice alone.
 Keep terminal semantics in Alacritty, PTY ownership in `terminal.rs`, document
 saving and recovery in `files.rs`, and workspace serialization in `model.rs`.
 
-Keep `docs/demo.gif` around 1 MB. Re-record it sparingly, only when the UI changes
+Keep `docs/demo.gif` under about 400 KB. Re-record it sparingly, only when the UI changes
 visibly, to avoid bloating repository history.
