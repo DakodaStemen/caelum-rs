@@ -19,6 +19,11 @@ use x11rb::{
 struct AppChild(Child);
 impl Drop for AppChild {
     fn drop(&mut self) {
+        if let Ok(Some(window)) = find_window(self.0.id())
+            && let Ok(keyboard) = Keyboard::new(window)
+        {
+            let _ = keyboard.capture("native-input-last-window");
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -86,6 +91,48 @@ impl Keyboard {
             )?
             .check()?;
         self.connection.flush()?;
+        Ok(())
+    }
+    fn capture(&self, name: &str) -> Result<()> {
+        let geometry = self.connection.get_geometry(self.window)?.reply()?;
+        let image = self
+            .connection
+            .get_image(
+                xproto::ImageFormat::Z_PIXMAP,
+                self.window,
+                0,
+                0,
+                geometry.width,
+                geometry.height,
+                u32::MAX,
+            )?
+            .reply()?;
+        let bpp = self
+            .connection
+            .setup()
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == image.depth)
+            .map(|f| f.bits_per_pixel)
+            .unwrap_or(0);
+        if bpp == 32 {
+            let rgba: Vec<u8> = image
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[2], p[1], p[0], 255])
+                .collect();
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".runtime");
+            fs::create_dir_all(&dir)?;
+            image::save_buffer(
+                dir.join(format!("{name}.png")),
+                &rgba,
+                geometry.width as u32,
+                geometry.height as u32,
+                image::ColorType::Rgba8,
+            )?;
+        }
         Ok(())
     }
     fn focus(&self) -> Result<()> {
@@ -257,6 +304,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
         caelum_rs::model::State::read(&profile.join("workspace.json"))
             .is_ok_and(|s| s.workspaces[0].tabs.len() == 2)
     })?;
+    eprintln!("new tab persisted");
     // Native editor edits, saves, and isolates keyboard input from the terminal behind its dialog.
     let fixture = dir.path().join("edit.txt");
     fs::write(&fixture, "original\n")?;
@@ -278,6 +326,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
                 .any(|p| matches!(p, caelum_rs::model::Pane::Editor { .. }))
         })
     })?;
+    eprintln!("native editor opened");
     // Click the editor text area in the right-hand pane; coordinates are logical X11 pixels.
     let geometry = keyboard.connection.get_geometry(keyboard.window)?.reply()?;
     keyboard.click((geometry.width as f32 * 0.80) as i16, 210)?;
@@ -289,6 +338,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     keyboard.press('s' as u32)?;
     keyboard.event(ctrl, false)?;
     wait(|| fs::read_to_string(&fixture).ok().as_deref() == Some("native editor save"))?;
+    eprintln!("native editor saved");
     // Graceful WM_DELETE_WINDOW causes native persistence and PTY shutdown.
     let atom = keyboard
         .connection

@@ -61,6 +61,8 @@ pub struct Session {
     threads: Vec<JoinHandle<()>>,
     size: Size,
     search_origin: Option<(String, Point)>,
+    pending_input: Vec<u8>,
+    wake: egui::Context,
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
@@ -175,14 +177,38 @@ impl Session {
             threads: vec![read_thread, write_thread],
             size,
             search_origin: None,
+            pending_input: Vec::new(),
+            wake: ctx,
         })
     }
     pub fn write(&mut self, bytes: Vec<u8>) {
-        if let Some(tx) = &self.input
-            && tx.try_send(bytes).is_err()
-        {
-            self.error =
-                Some("Terminal input is busy; try again when the process is reading".into());
+        const MAX_PENDING: usize = 8 * 1024 * 1024;
+        if self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING {
+            self.error = Some(
+                "Terminal input buffer is full; wait for the process to read before pasting again"
+                    .into(),
+            );
+            return;
+        }
+        self.pending_input.extend(bytes);
+        self.flush_input();
+    }
+    fn flush_input(&mut self) {
+        if self.pending_input.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.input {
+            let bytes = std::mem::take(&mut self.pending_input);
+            match tx.try_send(bytes) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(bytes)) => {
+                    self.pending_input = bytes;
+                    self.wake.request_repaint_after(Duration::from_millis(8));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.error = Some("Terminal input has closed".into())
+                }
+            }
         }
     }
     pub fn paste(&mut self, text: &str) {
@@ -201,6 +227,7 @@ impl Session {
         self.write(bytes);
     }
     pub fn poll(&mut self, theme: &Theme) {
+        self.flush_input();
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Title(title) => self.title = title,
@@ -1027,5 +1054,39 @@ mod regressions {
                 "child {child} is still running"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    fn burst_of_small_key_events_is_retained_under_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("typed");
+        let argv = [
+            "/usr/bin/env".into(),
+            "HISTFILE=/dev/null".into(),
+            "/bin/bash".into(),
+            "--noprofile".into(),
+            "--norc".into(),
+        ];
+        let mut s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
+        let text = "x".repeat(1000);
+        let command = format!("printf '%s' '{text}' > {}\r", file.display());
+        for byte in command.bytes() {
+            s.write(vec![byte]);
+        }
+        let theme = crate::theme::presets().remove("starlight").unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            s.poll(&theme);
+            if std::fs::read_to_string(&file).ok().as_deref() == Some(&text) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("Input was lost: {:?}", s.error);
     }
 }
