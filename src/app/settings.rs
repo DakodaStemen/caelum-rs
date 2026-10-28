@@ -1,39 +1,43 @@
 use super::*;
 
 impl App {
+    /// Applies a resolved system font when one is ready and starts resolving a changed
+    /// selection on a worker thread so `fc-match` never blocks the UI.
     pub(super) fn apply_font(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.font_rx {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    self.font_rx = None;
+                    if let Some(bytes) = bytes {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.font_data.insert(
+                            "system-mono".into(),
+                            egui::FontData::from_owned(bytes).into(),
+                        );
+                        fonts
+                            .families
+                            .entry(egui::FontFamily::Monospace)
+                            .or_default()
+                            .insert(0, "system-mono".into());
+                        ctx.set_fonts(fonts);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.font_rx = None,
+            }
+        }
         let name = self.state.preferences.terminal_font.clone();
         if name == self.applied_font {
             return;
         }
         self.applied_font = name.clone();
-        let output = std::process::Command::new("fc-match")
-            .args([
-                "-f",
-                "%{file}",
-                if name.is_empty() { "monospace" } else { &name },
-            ])
-            .output();
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let path = String::from_utf8_lossy(&output.stdout);
-            if let Ok(bytes) = fs::read(path.trim())
-                && ab_glyph::FontArc::try_from_vec(bytes.clone()).is_ok()
-            {
-                let mut fonts = egui::FontDefinitions::default();
-                fonts.font_data.insert(
-                    "system-mono".into(),
-                    egui::FontData::from_owned(bytes).into(),
-                );
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default()
-                    .insert(0, "system-mono".into());
-                ctx.set_fonts(fonts);
-            }
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.font_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_font(&name));
+            ctx.request_repaint();
+        });
     }
     pub(super) fn appearance(&mut self, ctx: &egui::Context) {
         let mut open = true;
@@ -228,4 +232,23 @@ impl App {
         self.theme_draft = draft;
         self.settings = open;
     }
+}
+
+/// Resolves a font family through fontconfig and returns its bytes if egui can parse them.
+fn resolve_font(name: &str) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("fc-match")
+        .args([
+            "-f",
+            "%{file}",
+            if name.is_empty() { "monospace" } else { name },
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout);
+    let bytes = fs::read(path.trim()).ok()?;
+    ab_glyph::FontArc::try_from_vec(bytes.clone()).ok()?;
+    Some(bytes)
 }
