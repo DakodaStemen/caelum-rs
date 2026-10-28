@@ -4,7 +4,7 @@ The native application owns its UI and application logic in Rust. It uses the OS
 graphics stack, fonts, shells and external commands as dependencies.
 
 - `model.rs`: typed workspace tree, layout operations, validation, separate profile
-  paths and atomic persistence. Import reads the legacy source without modifying it.
+  paths and atomic persistence. Import reads the source file without modifying it.
 - `terminal.rs`: owned PTY sessions, terminal parser, keyboard encoding and grid
   rendering. Alacritty owns terminal semantics; the application owns UI/input and
   process lifetime. Reader/parser and bounded input workers keep PTY I/O off the UI

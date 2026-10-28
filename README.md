@@ -10,13 +10,13 @@
 
 <p align="center"><img src="docs/demo.gif" width="100%" alt="Caelum Rust running shell commands, splitting panes right and below, zooming one, and switching between the Orbit, Aurora, Dawn and Starlight themes"></p>
 
-**An early, working native rewrite of [Caelum](https://github.com/DakodaStemen/caelum).**
-This repository is independent of the Electron version. It uses egui/eframe for the
-interface, Alacritty's terminal core, and portable-pty for real shell sessions.
-There is no Electron, JavaScript frontend, or Python bridge in this application.
+**A native workspace terminal for Linux.**
+Caelum uses egui/eframe for the interface, Alacritty's terminal core, and portable-pty
+for real shell sessions. It is a single Rust binary with no browser engine or scripting
+runtime.
 
-The existing Caelum release remains the reference application. This preview is
-not yet a feature-complete replacement, and no performance superiority is claimed.
+This is an early release: the remaining features are listed in
+[docs/migration.md](docs/migration.md). No performance claims are made.
 
 ## Working today
 
@@ -33,7 +33,7 @@ not yet a feature-complete replacement, and no performance superiority is claime
 - SSH through your existing client and configuration; Codex and Claude commands
   can run in terminal panes when installed.
 - Minimal by default: the sidebar is hidden until you press Ctrl+Shift+B (or the ≡ button).
-- Command palette, separate settings profile, and optional legacy workspace import.
+- Command palette, separate settings profile, and optional workspace import.
 
 ## Build and run
 
@@ -51,7 +51,7 @@ cd caelum-rs
 cargo run --release --locked
 ```
 
-To install alongside the existing Caelum, build once and run:
+To install, build once and run:
 
 ```sh
 cargo build --release --locked
@@ -61,7 +61,6 @@ caelum-rs
 
 The installer adds `~/.local/bin/caelum-rs` and a **Caelum Rust** app-menu entry.
 It copies the binary, so rebuilding the checkout does not change the installed app.
-It leaves the original `caelum` launcher and profile alone.
 
 ## Settings and migration
 
@@ -69,7 +68,7 @@ The Rust workspace lives under `$XDG_DATA_HOME/caelum-rs/`, or
 `~/.local/share/caelum-rs/` by default. Override it with `--data-dir PATH` or
 `CAELUM_RS_DATA`. Each profile permits one running instance to avoid competing saves.
 
-To import a **copy** of your existing workspace into a fresh Rust profile:
+To import a **copy** of an existing workspace JSON into a fresh profile:
 
 ```sh
 caelum-rs --import-legacy ~/.local/share/caelum/workspace.json

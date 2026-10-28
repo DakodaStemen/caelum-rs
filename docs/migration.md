@@ -1,10 +1,8 @@
-# Migration coverage
+# Feature status
 
-The Electron project is preserved at https://github.com/DakodaStemen/caelum.
-The Rust project has its own Git history, executable, app ID and profile. It does
-not replace the old installation or migrate settings automatically.
+Caelum has its own executable, app ID and profile.
 
-| Capability | Rust preview |
+| Capability | Status |
 | --- | --- |
 | PTYs, shell input, Ctrl+C, ANSI/true color, alternate screen | Implemented; real PTY and native input tests |
 | Workspaces, tabs, nested splits, resizing, zoom | Implemented |
@@ -25,18 +23,17 @@ not replace the old installation or migrate settings automatically.
 | Packaged distribution and signed updates | Pending; local installer and source build available |
 | Measured speed, memory or latency improvements | Not established |
 
-## Legacy workspace import
+## Workspace import
 
-`--import-legacy PATH` reads the old JSON workspace into the Rust model and saves
-it to a new Rust profile. It rejects an existing destination or unsupported
+`--import-legacy PATH` reads an exported JSON workspace and saves
+it to a new profile. It rejects an existing destination or unsupported
 schema rather than replacing user data. IDs and layout structure are preserved.
-Legacy `web` panes map to browser links. Unknown pane kinds fail import.
-Legacy SSH and assistant pane fields are retained as explicit terminal commands
+`web` panes map to browser links. Unknown pane kinds fail import.
+SSH and assistant pane fields are retained as explicit terminal commands
 when supported by the importer; review the resulting layout before use.
 
-The import does not restore old Electron browser state, running processes,
-terminal history, unsaved Electron editor buffers, or interface font choices.
-Import does not modify or write anything back to the legacy profile.
+The import does not restore browser state, running processes, terminal history,
+unsaved editor buffers, or interface font choices. It never writes back to the source file.
 
 ## Next gates
 
@@ -44,5 +41,5 @@ Import does not modify or write anything back to the legacy profile.
    multiplexers; selection, wide characters, mouse reporting and input methods.
 2. Complete Markdown/image previews and interface typography.
 3. Prototype native embedded browsing and assess its isolation and packaging.
-4. Audit accessibility and benchmark equivalent workflows against the preserved app.
-5. Ship a replacement release only after the remaining compatibility gates pass.
+4. Audit accessibility and benchmark common workflows.
+5. Ship a packaged release once the remaining gates pass.
