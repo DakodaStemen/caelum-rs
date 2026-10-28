@@ -1,9 +1,11 @@
 //! Headless tests (no display server): PTY sessions, documents, workspace state and themes.
 #![allow(clippy::field_reassign_with_default)]
 use alacritty_terminal::{grid::Dimensions, term::TermMode};
+#[cfg(unix)]
+use caelum_rs::model::Workspace;
 use caelum_rs::{
     files::Document,
-    model::{Axis, Pane, State, Workspace},
+    model::{Axis, Pane, State},
     terminal::Session,
     theme,
 };
