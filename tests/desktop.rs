@@ -390,6 +390,34 @@ fn record_demo() -> Result<()> {
     let work = dir.path().join("caelum-rs");
     fs::create_dir(&work)?;
     fs::write(work.join("README.md"), "# caelum-rs\n")?;
+    let sample = work.join("main.rs");
+    fs::write(
+        &sample,
+        r##"use std::collections::HashMap;
+
+/// A tiny word counter.
+#[derive(Debug, Default)]
+struct Counter {
+    seen: HashMap<String, usize>,
+}
+
+impl Counter {
+    fn add(&mut self, word: &str) -> usize {
+        let n = self.seen.entry(word.to_lowercase()).or_insert(0);
+        *n += 1; // count it
+        *n
+    }
+}
+
+fn main() {
+    let mut c = Counter::default();
+    for w in "Caelum builds fast, caelum looks great".split_whitespace() {
+        println!("{w:>8} -> {}", c.add(w));
+    }
+    assert_eq!(c.seen.len(), 5, "unique words: {:#?}", 3.14);
+}
+"##,
+    )?;
     let mut state = caelum_rs::model::State::default();
     state.workspaces[0].tabs[0].layout = caelum_rs::model::Pane::terminal(work.clone());
     state.save(&profile.join("workspace.json"))?;
@@ -435,7 +463,29 @@ fn record_demo() -> Result<()> {
     pause(1200);
     k.shortcut(0xff0d)?;
     pause(800);
-    for theme in ["Orbit", "Aurora", "Dawn", "Starlight"] {
+    let ctrl = k.key(0xffe3)?.0;
+    k.event(ctrl, true)?;
+    k.press('o' as u32)?;
+    k.event(ctrl, false)?;
+    pause(700);
+    k.event(ctrl, true)?;
+    k.press('a' as u32)?;
+    k.event(ctrl, false)?;
+    k.type_text(sample.to_str().context("sample path")?)?;
+    pause(500);
+    k.press(0xff0d)?;
+    pause(1200);
+    k.shortcut(0xff0d)?;
+    pause(1500);
+    for theme in [
+        "Orbit",
+        "Nebula",
+        "Mars",
+        "Aurora",
+        "Dawn",
+        "Lunar",
+        "Starlight",
+    ] {
         k.shortcut('p' as u32)?;
         pause(500);
         k.type_text(&format!("Theme: {theme}"))?;

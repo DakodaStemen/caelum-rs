@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use caelum_rs::{
     files::{self, Document, Draft},
     model::{self, Axis, Pane, State, Tab, Workspace},
+    syntax::Highlighter,
     terminal::{self, Session},
     theme::{self, Theme},
 };
@@ -157,6 +158,7 @@ pub struct App {
     applied_font: String,
     last_dialog: Option<String>,
     pending_save: Option<String>,
+    syntax: Highlighter,
 }
 struct Smoke {
     report: PathBuf,
@@ -260,6 +262,7 @@ impl App {
             applied_font: "__unset__".into(),
             last_dialog: None,
             pending_save: None,
+            syntax: Highlighter::default(),
         };
         app.restore_drafts();
         app.ensure_focus();
@@ -533,79 +536,111 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(theme.ui("chrome"))
-                    .inner_margin(12.),
+                    .stroke(Stroke::new(1_f32, theme.ui("border")))
+                    .inner_margin(egui::Margin::symmetric(14, 9)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.image((self.logo.id(), Vec2::splat(34.)));
+                    ui.image((self.logo.id(), Vec2::splat(30.)));
                     ui.label(
-                        RichText::new("CAELUM")
-                            .size(17.)
+                        RichText::new("Caelum")
+                            .size(18.)
                             .strong()
                             .color(theme.ui("textStrong")),
                     );
+                    badge(ui, theme, "RUST", theme.ui("accent"));
+                    ui.add_space(6.);
+                    ui.label(RichText::new("›").color(theme.ui("muted")));
                     ui.label(
-                        RichText::new("RUST PREVIEW")
-                            .size(10.)
-                            .color(theme.ui("accent")),
+                        RichText::new(self.workspace().name.clone())
+                            .color(theme.ui("textSecondary")),
                     );
-                    ui.separator();
-                    ui.label(self.workspace().name.clone());
+                    ui.label(RichText::new("›").color(theme.ui("muted")));
+                    ui.label(RichText::new(self.tab().name.clone()).color(theme.ui("text")));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Appearance").clicked() {
+                        if ui
+                            .button("Appearance")
+                            .on_hover_text("Themes, fonts and colors")
+                            .clicked()
+                        {
                             self.settings = true;
                         }
-                        if ui.button("Commands  Ctrl+Shift+P").clicked() {
+                        let palette = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Search commands…   Ctrl+Shift+P")
+                                        .color(theme.ui("muted")),
+                                )
+                                .fill(theme.ui("background"))
+                                .stroke(Stroke::new(1_f32, theme.ui("border"))),
+                            )
+                            .on_hover_text("Every action and theme in one place");
+                        if palette.clicked() {
                             self.action(Action::Palette, ctx);
                         }
                     });
                 });
             });
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::new().fill(theme.ui("chrome")).inner_margin(8.))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.ui("chrome"))
+                    .stroke(Stroke::new(1_f32, theme.ui("border")))
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme.ui("accent"), "*");
-                    ui.label(format!("{} sessions", self.terminals.len()));
-                    ui.separator();
-                    ui.label(self.cwd().display().to_string());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!(
-                            "{}  •  {}",
-                            self.theme().name,
-                            env!("CARGO_PKG_VERSION")
-                        ));
-                    });
-                });
-                if !self.message.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(theme.ui("accent"), self.message.clone());
-                        if ui.small_button("Dismiss").clicked() {
+                    dot(ui, theme.syn("string"));
+                    ui.label(
+                        RichText::new(format!("{} sessions", self.terminals.len()))
+                            .small()
+                            .color(theme.ui("textSecondary")),
+                    );
+                    ui.label(RichText::new("│").small().color(theme.ui("border")));
+                    ui.label(
+                        RichText::new(self.cwd().display().to_string())
+                            .small()
+                            .color(theme.ui("muted")),
+                    );
+                    if !self.message.is_empty() {
+                        ui.label(RichText::new("│").small().color(theme.ui("border")));
+                        ui.label(
+                            RichText::new(self.message.clone())
+                                .small()
+                                .strong()
+                                .color(theme.ui("accent")),
+                        );
+                        if ui.small_button("×").on_hover_text("Dismiss").clicked() {
                             self.message.clear();
                         }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  ·  v{}",
+                                self.theme().name,
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .small()
+                            .color(theme.ui("muted")),
+                        );
                     });
-                }
+                });
             });
     }
     fn sidebar(&mut self, ctx: &egui::Context, theme: &Theme) {
         egui::SidePanel::left("workspaces")
-            .default_width(205.)
-            .width_range(160. ..=320.)
-            .frame(egui::Frame::new().fill(theme.ui("panel")).inner_margin(14.))
+            .default_width(220.)
+            .width_range(180. ..=320.)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.ui("panel"))
+                    .stroke(Stroke::new(1_f32, theme.ui("border")))
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(8.);
-                ui.label(
-                    RichText::new("YOUR SPACE TO BUILD")
-                        .size(10.)
-                        .color(theme.ui("muted")),
-                );
-                ui.add_space(18.);
-                ui.label(
-                    RichText::new("WORKSPACES")
-                        .size(11.)
-                        .color(theme.ui("textSecondary")),
-                );
-                ui.add_space(8.);
+                ui.spacing_mut().item_spacing.y = 3.;
+                section(ui, theme, "WORKSPACES");
                 let workspaces: Vec<_> = self
                     .state
                     .workspaces
@@ -613,44 +648,42 @@ impl App {
                     .map(|w| (w.id.clone(), w.name.clone()))
                     .collect();
                 for (id, name) in workspaces {
-                    if ui
-                        .selectable_label(self.state.active_workspace == id, name.to_string())
-                        .clicked()
-                    {
+                    if nav_row(ui, theme, &name, "", self.state.active_workspace == id).clicked() {
                         self.state.active_workspace = id;
                         self.zoom = None;
                         self.ensure_focus();
                     }
                 }
-                if ui.button("+ Workspace").clicked() {
+                if nav_row(ui, theme, "+  New workspace", "", false).clicked() {
                     self.action(Action::NewWorkspace, ctx);
                 }
-                ui.add_space(12.);
-                if ui.small_button("Rename workspace").clicked() {
-                    self.dialog = Some("Rename workspace".into());
-                    self.dialog_input = self.workspace().name.clone();
-                }
-                if self.state.workspaces.len() > 1 && ui.small_button("Close workspace").clicked() {
-                    self.pending = Some(PendingClose::Workspace);
-                }
-                ui.add_space(24.);
-                ui.label(
-                    RichText::new("TOOLS")
-                        .size(11.)
-                        .color(theme.ui("textSecondary")),
-                );
-                for (name, a) in [
-                    ("Files", Action::Files),
-                    ("System", Action::System),
-                    ("Processes", Action::Processes),
-                    ("SSH", Action::Connect),
-                    ("Codex", Action::Assistant("codex".into())),
-                    ("Claude", Action::Assistant("claude".into())),
-                ] {
+                ui.horizontal(|ui| {
                     if ui
-                        .add_sized([ui.available_width(), 32.], egui::Button::new(name))
+                        .add(egui::Button::new(RichText::new("Rename").small()).frame(false))
                         .clicked()
                     {
+                        self.dialog = Some("Rename workspace".into());
+                        self.dialog_input = self.workspace().name.clone();
+                    }
+                    if self.state.workspaces.len() > 1
+                        && ui
+                            .add(egui::Button::new(RichText::new("Close").small()).frame(false))
+                            .clicked()
+                    {
+                        self.pending = Some(PendingClose::Workspace);
+                    }
+                });
+                ui.add_space(14.);
+                section(ui, theme, "TOOLS");
+                for (name, hint, a) in [
+                    ("Files", "browse · edit", Action::Files),
+                    ("System", "load · memory", Action::System),
+                    ("Processes", "live list", Action::Processes),
+                    ("SSH", "remote shell", Action::Connect),
+                    ("Codex", "assistant", Action::Assistant("codex".into())),
+                    ("Claude", "assistant", Action::Assistant("claude".into())),
+                ] {
+                    if nav_row(ui, theme, name, hint, false).clicked() {
                         self.action(a, ctx);
                     }
                 }
@@ -669,19 +702,27 @@ impl App {
             });
     }
     fn tabs(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal_wrapped(|ui| {
+        let theme = self.theme();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.;
             let tabs: Vec<_> = self
                 .workspace()
                 .tabs
                 .iter()
                 .map(|t| (t.id.clone(), t.name.clone()))
                 .collect();
+            let count = tabs.len();
             for (id, name) in tabs {
-                let response = ui.selectable_label(self.workspace().active_tab == id, name);
+                let active = self.workspace().active_tab == id;
+                let (response, close) = tab_chip(ui, &theme, &name, active, count > 1);
                 if response.clicked() {
-                    self.workspace_mut().active_tab = id;
+                    self.workspace_mut().active_tab = id.clone();
                     self.zoom = None;
                     self.ensure_focus();
+                }
+                if close {
+                    self.workspace_mut().active_tab = id;
+                    self.pending = Some(PendingClose::Tab);
                 }
                 if response.double_clicked() {
                     self.dialog = Some("Rename tab".into());
@@ -695,28 +736,35 @@ impl App {
             {
                 self.action(Action::NewTab, ctx);
             }
-            if ui.small_button("Close tab").clicked() {
-                self.pending = Some(PendingClose::Tab);
-            }
-            ui.separator();
-            if ui.button("Split right").clicked() {
-                self.action(Action::Split(Axis::Horizontal), ctx);
-            }
-            if ui.button("Split below").clicked() {
-                self.action(Action::Split(Axis::Vertical), ctx);
-            }
-            if ui
-                .button(if self.zoom.is_some() {
-                    "Restore"
-                } else {
-                    "Zoom"
-                })
-                .clicked()
-            {
-                self.action(Action::Zoom, ctx);
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(if self.zoom.is_some() {
+                        "Restore"
+                    } else {
+                        "Zoom"
+                    })
+                    .on_hover_text("Focus this pane (Ctrl+Shift+Enter)")
+                    .clicked()
+                {
+                    self.action(Action::Zoom, ctx);
+                }
+                if ui
+                    .button("Split below")
+                    .on_hover_text("Ctrl+Shift+E")
+                    .clicked()
+                {
+                    self.action(Action::Split(Axis::Vertical), ctx);
+                }
+                if ui
+                    .button("Split right")
+                    .on_hover_text("Ctrl+Shift+D")
+                    .clicked()
+                {
+                    self.action(Action::Split(Axis::Horizontal), ctx);
+                }
+            });
         });
-        ui.separator();
+        ui.add_space(4.);
     }
     fn layout(
         &mut self,
@@ -798,8 +846,15 @@ impl App {
         child.set_clip_rect(rect);
         egui::Frame::new().fill(theme.term("background")).stroke(Stroke::new(1_f32,if selected{theme.ui("accent")}else{theme.ui("border")})).show(&mut child,|ui|{
    ui.set_min_size((rect.size()-Vec2::splat(4.)).max(Vec2::splat(1.)));ui.set_max_size((rect.size()-Vec2::splat(4.)).max(Vec2::splat(1.)));
-   ui.horizontal(|ui|{let label=match &*node {Pane::Terminal{..}=>self.terminals.get(&id).map(|s|s.title.clone()).unwrap_or_else(||"Terminal".into()),Pane::Files{..}=>"Files".into(),Pane::Editor{path,..}=>format!("{}{}",if self.documents.get(&id).is_some_and(Document::dirty){"● "}else{""},path.file_name().unwrap_or_default().to_string_lossy()),Pane::System{..}=>"System".into(),Pane::Processes{..}=>"Processes".into(),Pane::Browser{..}=>"Browser link".into(),_=>String::new()};if ui.add(egui::Label::new(RichText::new(label).small().color(theme.ui("textSecondary"))).truncate().sense(Sense::click())).clicked(){focus_requested=true;}ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.small_button("×").clicked(){self.focused=id.clone();self.pending=Some(PendingClose::Pane);}
-if ui.small_button("Zoom").clicked(){self.focused=id.clone();self.zoom=if self.zoom.is_some(){None}else{Some(id.clone())};}});});
+   ui.horizontal(|ui|{let label=match &*node {Pane::Terminal{..}=>self.terminals.get(&id).map(|s|s.title.clone()).unwrap_or_else(||"Terminal".into()),Pane::Files{..}=>"Files".into(),Pane::Editor{path,..}=>path.file_name().unwrap_or_default().to_string_lossy().to_string(),Pane::System{..}=>"System".into(),Pane::Processes{..}=>"Processes".into(),Pane::Browser{..}=>"Browser link".into(),_=>String::new()};
+    let kind=match &*node {Pane::Terminal{..}=>"shell",Pane::Files{..}=>"files",Pane::Editor{..}=>"editor",Pane::System{..}=>"system",Pane::Processes{..}=>"processes",Pane::Browser{..}=>"link",_=>""};
+    dot(ui,if selected{theme.ui("accent")}else{theme.ui("borderStrong")});
+    let title=RichText::new(label).small().color(if selected{theme.ui("textStrong")}else{theme.ui("textSecondary")});
+    if ui.add(egui::Label::new(if selected{title.strong()}else{title}).truncate().sense(Sense::click())).clicked(){focus_requested=true;}
+    if self.documents.get(&id).is_some_and(Document::dirty) && matches!(&*node,Pane::Editor{..}){ui.colored_label(theme.syn("number"),"● unsaved");}
+    ui.label(RichText::new(kind).size(10.).color(theme.ui("muted")));
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.add(egui::Button::new("×").frame(false).small()).on_hover_text("Close pane (Ctrl+Shift+W)").clicked(){self.focused=id.clone();self.pending=Some(PendingClose::Pane);}
+if ui.add(egui::Button::new("Zoom").frame(false).small()).on_hover_text("Zoom or restore (Ctrl+Shift+Enter)").clicked(){self.focused=id.clone();self.zoom=if self.zoom.is_some(){None}else{Some(id.clone())};}});});
    ui.separator();match node {
     Pane::Terminal{cwd,command,..}=>{
      if !self.terminals.contains_key(&id){let test_command=vec!["/usr/bin/env".into(),"HISTFILE=/dev/null".into(),"PS1=$ ".into(),"/bin/bash".into(),"--noprofile".into(),"--norc".into(),"-i".into()];match Session::spawn(cwd,if self.smoke.is_some(){Some(test_command.as_slice())}else{command.as_deref()},ctx.clone()){Ok(s)=>{self.terminals.insert(id.clone(),s);},Err(e)=>{ui.colored_label(theme.ui("danger"),format!("Cannot open terminal: {e}"));return;}}}
@@ -812,14 +867,17 @@ if ui.small_button("Zoom").clicked(){self.focused=id.clone();self.zoom=if self.z
      ui.horizontal(|ui|{if ui.small_button("Up").clicked()&& let Some(parent)=path.parent(){*path=parent.to_path_buf();}let edit=ui.add(egui::TextEdit::singleline(&mut view.path_input).desired_width(ui.available_width()));if edit.lost_focus() && ui.input(|i|i.key_pressed(Key::Enter)){let requested=PathBuf::from(&view.path_input);*path=if requested.is_absolute(){requested}else{path.join(requested)};}});
      if ui.add(egui::TextEdit::singleline(&mut view.filter).hint_text("Filter files…")).changed(){view.refreshed=None;}
 if !view.error.is_empty(){ui.colored_label(theme.ui("danger"),&view.error);}let mut open=None;
-     egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{for entry in &view.entries{let response=ui.selectable_label(false,format!("{}  {}",if entry.directory{"/"}else{" "},entry.name));if response.double_clicked(){if entry.directory{*path=entry.path.clone();}else{open=Some(entry.path.clone());}}}});
+     egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{for entry in &view.entries{let label=RichText::new(format!("{}  {}",if entry.directory{"▸"}else{"·"},entry.name)).color(if entry.directory{theme.syn("function")}else{theme.ui("text")});let response=ui.selectable_label(false,label);if response.double_clicked(){if entry.directory{*path=entry.path.clone();}else{open=Some(entry.path.clone());}}}});
      if let Some(path)=open{self.pending_open=Some(path);}
     },
     Pane::Editor{path,..}=>{
      if !self.documents.contains_key(&id){match Document::open(path){Ok(doc)=>{self.documents.insert(id.clone(),doc);},Err(e)=>{ui.colored_label(theme.ui("danger"),e.to_string());return;}}}
+     let language=self.syntax.language(path).unwrap_or_else(||"Plain text".into());
      let doc=self.documents.get_mut(&id).unwrap();ui.horizontal(|ui|{if ui.add_enabled(!doc.read_only && doc.dirty(),egui::Button::new("Save  Ctrl+S")).clicked(){self.pending_save=Some(id.clone());}
-if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read only");}ui.label(RichText::new(doc.path.display().to_string()).small());});
-     let edit=egui::TextEdit::multiline(&mut doc.text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(!doc.read_only).code_editor();
+if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read only");}badge(ui,theme,&language,theme.syn("function"));ui.label(RichText::new(format!("{} lines",doc.text.lines().count().max(1))).small().color(theme.ui("muted")));ui.label(RichText::new(doc.path.display().to_string()).small().color(theme.ui("muted")));});
+     let font=FontId::monospace(self.state.preferences.font_size);let doc_path=doc.path.clone();let syntax=&mut self.syntax;
+     let mut layouter=|ui:&egui::Ui,text:&dyn egui::TextBuffer,wrap:f32|{let job=syntax.job(&doc_path,text.as_str(),theme,font.clone(),wrap);ui.fonts_mut(|f|f.layout_job(job))};
+     let edit=egui::TextEdit::multiline(&mut doc.text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(!doc.read_only).code_editor().layouter(&mut layouter);
      egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{if ui.add_sized(ui.available_size().max(Vec2::new(1.,100.)),edit).has_focus(){focus_requested=true;}});
     },
     Pane::System{..}=>{self.system.refresh();egui::ScrollArea::vertical().show(ui,|ui|{ui.add_space(16.);for (name,value) in [("LOAD AVERAGE",&self.system.load),("MEMORY",&self.system.memory),("UPTIME",&self.system.uptime)]{ui.label(RichText::new(name).small().color(theme.ui("muted")));ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));ui.add_space(20.);}ui.label(format!("{} logical CPUs",std::thread::available_parallelism().map(usize::from).unwrap_or(1)));ui.label(std::env::consts::OS);});},
@@ -1662,6 +1720,149 @@ impl eframe::App for App {
         self.persist();
         self.terminals.clear();
     }
+}
+fn dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+}
+fn badge(ui: &mut egui::Ui, theme: &Theme, text: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.16))
+        .stroke(Stroke::new(1_f32, color.gamma_multiply(0.5)))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(10.).strong().color(color));
+        });
+    let _ = theme;
+}
+fn section(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.add_space(4.);
+    ui.label(
+        RichText::new(text)
+            .size(10.5)
+            .strong()
+            .color(theme.ui("muted")),
+    );
+    ui.add_space(2.);
+}
+/// A full-width sidebar row with an accent bar when active and an optional right-hand hint.
+fn nav_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    hint: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        let fill = if active {
+            theme.ui("tabActive")
+        } else if response.hovered() {
+            theme.ui("surface")
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, 7, fill);
+        if active {
+            let bar = Rect::from_min_size(
+                rect.left_top() + Vec2::new(0., 6.),
+                Vec2::new(3., rect.height() - 12.),
+            );
+            ui.painter().rect_filled(bar, 2, theme.ui("accent"));
+        }
+        let color = if active || response.hovered() {
+            theme.ui("textStrong")
+        } else {
+            theme.ui("text")
+        };
+        ui.painter().text(
+            rect.left_center() + Vec2::new(12., 0.),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(14.),
+            color,
+        );
+        if !hint.is_empty() {
+            ui.painter().text(
+                rect.right_center() - Vec2::new(10., 0.),
+                egui::Align2::RIGHT_CENTER,
+                hint,
+                FontId::proportional(11.),
+                theme.ui("muted"),
+            );
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+/// A tab chip; returns the chip response and whether its close button was clicked.
+fn tab_chip(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    name: &str,
+    active: bool,
+    closable: bool,
+) -> (egui::Response, bool) {
+    let font = FontId::proportional(14.);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(name.to_string(), font, Color32::WHITE);
+    let close_w = if closable { 22. } else { 0. };
+    let size = Vec2::new(galley.size().x + 28. + close_w, 32.);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    let mut closed = false;
+    if ui.is_rect_visible(rect) {
+        let fill = if active {
+            theme.term("background")
+        } else if response.hovered() {
+            theme.ui("surface")
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, 8, fill);
+        if active {
+            let bar = Rect::from_min_size(
+                rect.left_bottom() - Vec2::new(-8., 3.),
+                Vec2::new(rect.width() - 16., 3.),
+            );
+            ui.painter().rect_filled(bar, 2, theme.ui("accent"));
+        }
+        let color = if active {
+            theme.ui("textStrong")
+        } else {
+            theme.ui("textSecondary")
+        };
+        ui.painter().text(
+            rect.left_center() + Vec2::new(14., -1.),
+            egui::Align2::LEFT_CENTER,
+            name,
+            FontId::proportional(14.),
+            color,
+        );
+        if closable && (active || response.hovered()) {
+            let x =
+                Rect::from_center_size(rect.right_center() - Vec2::new(16., 1.), Vec2::splat(18.));
+            let hit = ui.interact(x, response.id.with("close"), Sense::click());
+            if hit.hovered() {
+                ui.painter().rect_filled(x, 5, theme.ui("border"));
+            }
+            ui.painter().text(
+                x.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                FontId::proportional(14.),
+                theme.ui("muted"),
+            );
+            closed = hit.on_hover_text("Close tab").clicked();
+        }
+    }
+    (
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        closed,
+    )
 }
 fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
     if root.id() == id {

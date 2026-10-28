@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Vibrant syntax highlighting in the editor (Rust, Python, JavaScript, JSON, Markdown, HTML,
+  CSS, shell, YAML, TOML and more), colored by each theme's new `syntax` palette.
+- All ten themes rebuilt with richer accents, clearer surfaces and brighter terminal colors.
+- Interface overhaul: breadcrumb header, command-search pill, sidebar rows with hints and an
+  active marker, tab chips with inline close, focus-aware pane headers, rounded controls,
+  shortcut tooltips and a quieter status bar.
+
 ## 0.1.0 — Native preview
 
 - Native Rust desktop app using egui, Alacritty's terminal core and portable-pty.

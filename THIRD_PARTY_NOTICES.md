@@ -9,6 +9,7 @@ Core components include:
 - egui/eframe: MIT OR Apache-2.0 — https://github.com/emilk/egui
 - portable-pty: MIT — https://github.com/wezterm/wezterm
 - serde/serde_json: MIT OR Apache-2.0 — https://github.com/serde-rs
+- syntect (syntax parsing and bundled Sublime syntaxes): MIT — https://github.com/trishume/syntect
 - image: MIT OR Apache-2.0 — https://github.com/image-rs/image
 
 The supplied Caelum SVG is retained as an icon without its lettering. Source SVGs

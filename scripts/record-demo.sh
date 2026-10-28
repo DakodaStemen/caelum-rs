@@ -12,7 +12,7 @@ trap 'kill $XPID 2>/dev/null || true' EXIT
 sleep 2
 DISPLAY=$D WAYLAND_DISPLAY= cargo test --locked --test desktop --no-run >/dev/null 2>&1
 DISPLAY=$D ffmpeg -loglevel error -y -f x11grab -framerate 15 -video_size 1360x880 -i $D \
-  -t 75 .runtime/demo.mp4 &
+  -t 90 .runtime/demo.mp4 &
 FPID=$!
 sleep 1
 CAELUM_RECORD_DEMO=1 DISPLAY=$D WAYLAND_DISPLAY= cargo test --locked --test desktop -- --ignored record_demo

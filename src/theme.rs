@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use eframe::egui::{Color32, Context, Visuals};
+use eframe::egui::{Color32, Context, CornerRadius, Stroke, Vec2, Visuals, epaint::Shadow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -10,6 +10,8 @@ pub struct Theme {
     pub kind: String,
     pub ui: BTreeMap<String, String>,
     pub terminal: BTreeMap<String, String>,
+    #[serde(default)]
+    pub syntax: BTreeMap<String, String>,
 }
 static BUILTIN: std::sync::LazyLock<BTreeMap<String, Theme>> = std::sync::LazyLock::new(|| {
     let mut themes: BTreeMap<String, Theme> =
@@ -69,6 +71,24 @@ impl Theme {
             .and_then(|s| color(s))
             .unwrap_or(Color32::WHITE)
     }
+    /// Code color for a token kind; themes without a `syntax` table borrow terminal colors.
+    pub fn syn(&self, key: &str) -> Color32 {
+        if let Some(c) = self.syntax.get(key).and_then(|s| color(s)) {
+            return c;
+        }
+        match key {
+            "comment" => self.ui("muted"),
+            "keyword" => self.term("brightMagenta"),
+            "string" => self.term("green"),
+            "number" | "constant" | "parameter" => self.term("yellow"),
+            "function" => self.term("blue"),
+            "type" | "operator" | "escape" => self.term("cyan"),
+            "tag" => self.term("red"),
+            "attribute" => self.term("brightYellow"),
+            "punctuation" => self.ui("textSecondary"),
+            _ => self.term("foreground"),
+        }
+    }
     pub fn apply(&self, ctx: &Context) {
         let mut v = if self.kind == "light" {
             Visuals::light()
@@ -89,7 +109,39 @@ impl Theme {
         v.widgets.active.bg_fill = self.ui("button");
         v.widgets.active.weak_bg_fill = self.ui("button");
         v.hyperlink_color = self.ui("accent");
+        let round = CornerRadius::same(7);
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.corner_radius = round;
+        }
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1_f32, self.ui("border"));
+        v.widgets.hovered.bg_stroke = Stroke::new(1_f32, self.ui("accent"));
+        v.widgets.active.bg_stroke = Stroke::new(1_f32, self.ui("accent"));
+        v.widgets.hovered.fg_stroke.color = self.ui("textStrong");
+        v.widgets.active.fg_stroke.color = self.ui("textStrong");
+        v.window_corner_radius = CornerRadius::same(12);
+        v.menu_corner_radius = CornerRadius::same(10);
+        v.window_stroke = Stroke::new(1_f32, self.ui("borderStrong"));
+        v.window_shadow = Shadow {
+            offset: [0, 10],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(if self.kind == "light" { 50 } else { 140 }),
+        };
+        v.selection.bg_fill = self.ui("accent").gamma_multiply(0.35);
+        v.text_cursor.stroke = Stroke::new(2_f32, self.ui("accent"));
         ctx.set_visuals(v);
+        ctx.style_mut(|st| {
+            st.spacing.item_spacing = Vec2::new(8., 7.);
+            st.spacing.button_padding = Vec2::new(11., 6.);
+            st.spacing.interact_size.y = 28.;
+            st.spacing.scroll.bar_width = 8.;
+        });
     }
 }
 #[cfg(test)]
@@ -101,6 +153,9 @@ mod tests {
         assert_eq!(p.len(), 10);
         for t in p.values() {
             t.validate().unwrap();
+            for key in crate::syntax::KINDS {
+                assert!(t.syntax.contains_key(*key), "{} lacks {key}", t.name);
+            }
         }
     }
     #[test]
