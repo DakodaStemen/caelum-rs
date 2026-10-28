@@ -3,7 +3,7 @@ name = "caelum-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A native Rust workspace terminal. Your space to build."
+description = "Caelum: a native workspace terminal for Linux, built in Rust. Your space to build."
 license = "MIT"
 repository = "https://github.com/DakodaStemen/caelum-rs"
 
