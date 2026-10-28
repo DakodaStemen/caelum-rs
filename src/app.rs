@@ -314,7 +314,7 @@ impl App {
                     .cloned()
             })
             .or_else(|| self.presets.get(&self.state.preferences.theme).cloned())
-            .unwrap_or_else(|| self.presets["starlight"].clone())
+            .unwrap_or_else(|| self.presets["orbit"].clone())
     }
     fn workspace(&self) -> &Workspace {
         &self.state.workspaces[self.state.active_index()]

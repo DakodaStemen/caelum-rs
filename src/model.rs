@@ -197,7 +197,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            theme: "starlight".into(),
+            theme: "orbit".into(),
             font_size: 15.,
             terminal_font: String::new(),
             line_height: 1.2,

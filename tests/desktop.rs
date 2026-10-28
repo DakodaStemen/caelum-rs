@@ -475,10 +475,10 @@ fn main() {
         pause(wait);
         Ok(())
     };
-    for name in ["Orbit", "Mars", "Aurora", "Dawn", "Lunar", "Starlight"] {
-        theme(name, 1300)?;
+    // Default dark, a second dark, a light theme, then back to the default.
+    for name in ["Aurora", "Dawn", "Orbit"] {
+        theme(name, 1600)?;
     }
-    theme("Nebula", 1500)?;
     // Edit in the pane: add a comment, then save with the pane's own Save button.
     let geometry = k.connection.get_geometry(k.window)?.reply()?;
     let width = geometry.width as i16;
