@@ -573,8 +573,15 @@ impl App {
                 .default_width(540.)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
+                    let hint = match title.as_str() {
+                        "Connect with SSH" => "host or user@host",
+                        "Open file" => "path to a file",
+                        "Search terminal" => "search text",
+                        _ => "name",
+                    };
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.dialog_input)
+                            .hint_text(hint)
                             .desired_width(f32::INFINITY),
                     );
                     if !ctx.wants_keyboard_input() {
@@ -598,7 +605,11 @@ impl App {
                             .button(if title == "Search terminal" {
                                 "Done"
                             } else {
-                                "Apply"
+                                match title.as_str() {
+                                    "Connect with SSH" => "Connect",
+                                    "Open file" => "Open",
+                                    _ => "Rename",
+                                }
                             })
                             .clicked()
                             || ui.input(|i| i.key_pressed(Key::Enter))

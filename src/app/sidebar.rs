@@ -69,9 +69,12 @@ impl App {
                 ui.horizontal(|ui| {
                     dot(ui, theme.syn("string"));
                     ui.label(
-                        RichText::new(format!("{} sessions", self.terminals.len()))
-                            .small()
-                            .color(theme.ui("textSecondary")),
+                        RichText::new(match self.terminals.len() {
+                            1 => "1 session".to_string(),
+                            n => format!("{n} sessions"),
+                        })
+                        .small()
+                        .color(theme.ui("textSecondary")),
                     );
                     ui.label(RichText::new("│").small().color(theme.ui("border")));
                     ui.label(
