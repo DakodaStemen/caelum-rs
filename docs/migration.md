@@ -8,7 +8,7 @@ not replace the old installation or migrate settings automatically.
 | --- | --- |
 | PTYs, shell input, Ctrl+C, ANSI/true color, alternate screen | Implemented; real PTY and native input tests |
 | Workspaces, tabs, nested splits, resizing, zoom | Implemented |
-| Theme presets and custom color import/export | Implemented; all ten source palettes retained |
+| Theme presets and custom color import/export | Implemented; all ten source palettes retained, plus the new Graphite default |
 | Terminal font, size, cursor, line height | Implemented; font discovery via system fontconfig |
 | Per-interface font settings | Pending |
 | Files, text editing, save conflict checks | Implemented |

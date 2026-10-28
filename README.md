@@ -27,7 +27,7 @@ not yet a feature-complete replacement, and no performance superiority is claime
 - File browsing and UTF-8 text editing; external-change checks, atomic saves,
   permission and symlink preservation, and read-only previews for unknown encodings.
 - Recovery snapshots for unsaved edits and confirmation before discarding them.
-- Ten coordinated interface, terminal and code themes, custom color editing with live preview,
+- Eleven coordinated interface, terminal and code themes, custom color editing with live preview,
   JSON import/export, terminal font, size, line height and cursor settings.
 - Live Linux memory, load, uptime and process views.
 - SSH through your existing client and configuration; Codex and Claude commands

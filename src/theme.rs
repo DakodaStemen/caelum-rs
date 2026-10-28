@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn bundled_themes_complete() {
         let p = presets();
-        assert_eq!(p.len(), 10);
+        assert_eq!(p.len(), 11);
         for t in p.values() {
             t.validate().unwrap();
             for key in crate::syntax::KINDS {

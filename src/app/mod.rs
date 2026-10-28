@@ -289,7 +289,7 @@ impl App {
                     .cloned()
             })
             .or_else(|| self.presets.get(&self.state.preferences.theme).cloned())
-            .unwrap_or_else(|| self.presets["orbit"].clone())
+            .unwrap_or_else(|| self.presets["graphite"].clone())
     }
     fn workspace(&self) -> &Workspace {
         &self.state.workspaces[self.state.active_index()]
@@ -844,10 +844,10 @@ impl App {
                         bail!("New tab failed");
                     }
                     s.checks.push("New tab owns an independent terminal".into());
-                    self.action(Action::Theme("orbit".into()), ctx);
+                    self.action(Action::Theme("graphite".into()), ctx);
                     self.persist();
                     let restored = State::read(&self.profile.join("workspace.json"))?;
-                    if restored.preferences.theme != "orbit" {
+                    if restored.preferences.theme != "graphite" {
                         bail!("Theme was not persisted");
                     }
                     s.checks
