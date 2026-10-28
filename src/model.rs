@@ -11,53 +11,7 @@ use uuid::Uuid;
 pub fn id() -> String {
     Uuid::new_v4().to_string()
 }
-pub fn home() -> PathBuf {
-    resolve_home(std::env::var_os("HOME"), passwd_home)
-}
-/// Pure helper: use `env` unless unset/empty, then `passwd`, then `/`.
-fn resolve_home(
-    env: Option<std::ffi::OsString>,
-    passwd: impl FnOnce() -> Option<PathBuf>,
-) -> PathBuf {
-    env.filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| passwd().filter(|p| !p.as_os_str().is_empty()))
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-#[cfg(unix)]
-fn passwd_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    // SAFETY: getpwuid_r writes only into the buffers we provide; pw_dir is read
-    // while buf is alive and copied before returning.
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let mut result: *mut libc::passwd = std::ptr::null_mut();
-            let rc = libc::getpwuid_r(
-                libc::getuid(),
-                &mut pwd,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                &mut result,
-            );
-            if rc == libc::ERANGE && buf.len() < 1 << 20 {
-                let n = buf.len() * 2;
-                buf.resize(n, 0);
-                continue;
-            }
-            if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
-                return None;
-            }
-            let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes().to_vec();
-            return Some(PathBuf::from(std::ffi::OsString::from_vec(dir)));
-        }
-    }
-}
-#[cfg(not(unix))]
-fn passwd_home() -> Option<PathBuf> {
-    None
-}
+pub use crate::platform::home;
 /// Creates `path` (and parents); on unix new directories get mode 0700. When
 /// `fix_existing` is set, an already-existing `path` is tightened to 0700 (best effort).
 pub fn create_private_dir(path: &Path, fix_existing: bool) -> Result<()> {
@@ -82,12 +36,7 @@ pub fn create_private_dir(path: &Path, fix_existing: bool) -> Result<()> {
 pub fn profile() -> PathBuf {
     std::env::var_os("CAELUM_RS_DATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home().join(".local/share"))
-                .join("caelum-rs")
-        })
+        .unwrap_or_else(crate::platform::default_profile_dir)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -464,18 +413,6 @@ mod tests {
         assert_eq!(fs::metadata(&loose).unwrap().mode() & 0o777, 0o755);
         create_private_dir(&loose, true).unwrap();
         assert_eq!(fs::metadata(&loose).unwrap().mode() & 0o777, 0o700);
-    }
-    #[test]
-    fn home_fallback_order() {
-        let pw = || Some(PathBuf::from("/home/pw"));
-        assert_eq!(resolve_home(Some("/h".into()), pw), PathBuf::from("/h"));
-        assert_eq!(resolve_home(Some("".into()), pw), PathBuf::from("/home/pw"));
-        assert_eq!(resolve_home(None, pw), PathBuf::from("/home/pw"));
-        assert_eq!(resolve_home(None, || None), PathBuf::from("/"));
-        assert_eq!(
-            resolve_home(Some("".into()), || Some(PathBuf::new())),
-            PathBuf::from("/")
-        );
     }
     #[test]
     fn nested_layout_collapses_without_losing_sibling() {

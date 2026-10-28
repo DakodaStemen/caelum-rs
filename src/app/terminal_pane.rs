@@ -13,18 +13,7 @@ impl App {
         command: &Option<Vec<String>>,
     ) -> bool {
         if !self.terminals.contains_key(id) {
-            let test_command: Vec<String> = [
-                "/usr/bin/env",
-                "HISTFILE=/dev/null",
-                "PS1=$ ",
-                "/bin/bash",
-                "--noprofile",
-                "--norc",
-                "-i",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            let test_command = caelum_rs::platform::test_shell_command();
             let chosen = if self.smoke.is_some() {
                 Some(test_command.as_slice())
             } else {

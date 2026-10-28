@@ -52,6 +52,7 @@ fn terminal_exit_is_detected_and_output_kept() {
     wait(&mut s, "output", |s| s.text().contains("hello-caelum"));
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_empty_argv_is_an_error() {
     let none: Vec<String> = vec![];
@@ -68,6 +69,7 @@ fn terminal_ctrl_c_interrupts_foreground_process() {
     wait(&mut s, "trap output", |s| s.text().contains("got-int"));
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_resize_reaches_pty_and_grid() {
     let mut s = spawn("stty size; read x; stty size; sleep 30");
@@ -138,6 +140,7 @@ fn terminal_wide_characters_occupy_two_cells_but_one_char() {
     assert_eq!(g[Point::new(Line(0), Column(4))].c, 'a');
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_burst_input_is_fully_retained_in_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -231,6 +234,7 @@ fn document_same_content_external_touch_still_saves() {
 
 // ---------- model::State ----------
 
+#[cfg(unix)]
 #[test]
 fn state_round_trips_through_disk() {
     let d = tempfile::tempdir().unwrap();
@@ -341,6 +345,7 @@ fn corrupt_workspace_files_are_errors_not_panics() {
     assert!(State::read(&d.path().join("absent.json")).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn legacy_import_rejects_bad_ssh_host() {
     let d = tempfile::tempdir().unwrap();
