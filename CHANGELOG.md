@@ -7,7 +7,7 @@ No release tag has been cut yet; `0.1.0` below is the Cargo version, not a publi
 - Vibrant syntax highlighting in the editor (Rust, Python, JavaScript, JSON, Markdown, HTML,
   CSS, shell, YAML, TOML and more), colored by each theme's new `syntax` palette.
 - The custom theme editor now includes the code (syntax) colors, listed first.
-- Orbit is the new default theme.
+- Graphite, a neutral grey theme with muted terminal colors, is the new default. Orbit stays available.
 - The sidebar is hidden by default for a minimal window; Ctrl+Shift+B or the header button
   slides it in and out, and the choice is remembered. The header is slimmer too.
 - The Appearance window opens centered.

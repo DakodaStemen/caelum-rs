@@ -99,7 +99,7 @@ impl App {
                             cancel_draft = ui.button("Cancel preview").clicked();
                         });
                     } else {
-                        ui.label("TEN PRESETS · YOUR OWN COLORS");
+                        ui.label("ELEVEN PRESETS · YOUR OWN COLORS");
                         ui.add_space(8.);
                         egui::Grid::new("themes")
                             .num_columns(5)

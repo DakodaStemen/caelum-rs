@@ -489,8 +489,8 @@ fn main() {
         pause(wait);
         Ok(())
     };
-    // Default dark, a second dark, a light theme, then back to the default.
-    for name in ["Aurora", "Dawn", "Orbit"] {
+    // Default dark, a second dark, a light theme, then back to the neutral default.
+    for name in ["Aurora", "Dawn", "Graphite"] {
         theme(name, 1280)?;
     }
     // Quick look at custom themes: open Appearance, then start a customised copy.
