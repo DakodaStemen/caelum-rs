@@ -10,8 +10,6 @@
 
 <p align="center"><img src="docs/demo.gif" width="100%" alt="Caelum Rust running shell commands, splitting panes right and below, zooming one, and switching between the Orbit, Aurora, Dawn and Starlight themes"></p>
 
-<p align="center"><img src="docs/desktop.png" width="100%" alt="Caelum Rust with live terminal splits and a file browser"></p>
-
 **An early, working native rewrite of [Caelum](https://github.com/DakodaStemen/caelum).**
 This repository is independent of the Electron version. It uses egui/eframe for the
 interface, Alacritty's terminal core, and portable-pty for real shell sessions.
