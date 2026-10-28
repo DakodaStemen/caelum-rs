@@ -12,7 +12,7 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.image((self.logo.id(), Vec2::splat(30.)));
+                    ui.image((self.logo.id(), Vec2::splat(24.)));
                     ui.label(
                         RichText::new("Caelum")
                             .size(18.)

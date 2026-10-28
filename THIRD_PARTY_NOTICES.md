@@ -12,7 +12,7 @@ Core components include:
 - syntect (syntax parsing and bundled Sublime syntaxes): MIT — https://github.com/trishume/syntect
 - image: MIT OR Apache-2.0 — https://github.com/image-rs/image
 
-The supplied Caelum SVG is retained as an icon without its lettering. Source SVGs
+The Caelum mark is a hand-written SVG redraw (three nested crescent arcs) of the supplied icon, without lettering. Source SVGs
 are in `assets/brand`; `mark-app.svg` adds weight for small-size readability, and
 `icon.png` is its application rendering. Rust does not remove licensing obligations
 for bundled assets, fonts or third-party code.
