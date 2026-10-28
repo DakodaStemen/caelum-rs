@@ -370,6 +370,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     Ok(())
 }
 /// Plays a paced session for README recording; run under Xvfb with `ffmpeg -f x11grab` capturing.
+const DEMO_CUSTOMIZE: (i16, i16) = (445, 405);
 #[test]
 #[ignore = "demo recording: scripts/record-demo.sh"]
 fn record_demo() -> Result<()> {
@@ -445,44 +446,64 @@ fn main() {
     let run = |cmd: &str| -> Result<()> {
         for c in cmd.chars() {
             k.type_text(&c.to_string())?;
-            pause(45);
+            pause(36);
         }
-        pause(250);
+        pause(200);
         k.press(0xff0d)?;
-        pause(1100);
+        pause(880);
         Ok(())
     };
-    pause(1500);
+    pause(1200);
     k.click(500, 300)?;
     run("printf '\\033[31mred  \\033[32mgreen  \\033[34mblue\\033[0m\\n'")?;
-    pause(1200);
+    pause(960);
+    run(
+        "for i in $(seq 0 3 255); do printf \"\\033[48;2;%d;%d;255m \\033[0m\" $i $((255-i)); done; echo",
+    )?;
+    pause(960);
+    // The sidebar is hidden by default; flash it open and shut with one shortcut.
+    k.shortcut('b' as u32)?;
+    pause(1400);
+    k.shortcut('b' as u32)?;
+    pause(700);
     let ctrl = k.key(0xffe3)?.0;
     k.event(ctrl, true)?;
     k.press('o' as u32)?;
     k.event(ctrl, false)?;
-    pause(700);
+    pause(560);
     k.event(ctrl, true)?;
     k.press('a' as u32)?;
     k.event(ctrl, false)?;
     k.type_text(sample.to_str().context("sample path")?)?;
-    pause(500);
+    pause(400);
     k.press(0xff0d)?;
-    pause(1200);
+    pause(960);
     k.shortcut(0xff0d)?;
-    pause(1500);
+    pause(1200);
     let theme = |name: &str, wait: u64| -> Result<()> {
         k.shortcut('p' as u32)?;
-        pause(500);
+        pause(400);
         k.type_text(&format!("Theme: {name}"))?;
-        pause(600);
+        pause(480);
         k.press(0xff0d)?;
         pause(wait);
         Ok(())
     };
     // Default dark, a second dark, a light theme, then back to the default.
     for name in ["Aurora", "Dawn", "Orbit"] {
-        theme(name, 1600)?;
+        theme(name, 1280)?;
     }
+    // Quick look at custom themes: open Appearance, then start a customised copy.
+    k.shortcut('p' as u32)?;
+    pause(400);
+    k.type_text("Appearance")?;
+    pause(480);
+    k.press(0xff0d)?;
+    pause(1760);
+    k.click(DEMO_CUSTOMIZE.0, DEMO_CUSTOMIZE.1)?;
+    pause(2240);
+    k.press(0xff1b)?;
+    pause(800);
     // Edit in the pane: add a comment, then save with the pane's own Save button.
     let geometry = k.connection.get_geometry(k.window)?.reply()?;
     let width = geometry.width as i16;
@@ -490,25 +511,21 @@ fn main() {
     k.event(ctrl, true)?;
     k.press(0xff50)?;
     k.event(ctrl, false)?;
-    pause(400);
+    pause(320);
     for c in "// Saved straight from the pane".chars() {
         k.type_text(&c.to_string())?;
-        pause(60);
+        pause(48);
     }
     k.press(0xff0d)?;
-    pause(1200);
-    k.click(276, 163)?;
-    pause(1800);
+    pause(960);
+    k.click(55, 154)?;
+    pause(1440);
     // Close the pane with its own button, back to the terminal.
-    k.click(width - 18, 117)?;
-    pause(1500);
-    k.click(width / 2, 300)?;
-    run(
-        "for i in $(seq 0 3 255); do printf \"\\033[48;2;%d;%d;255m \\033[0m\" $i $((255-i)); done; echo",
-    )?;
+    k.click(width - 13, 106)?;
     pause(1200);
+    k.click(width / 2, 300)?;
     run("echo 'Saved and shipped with Caelum.'")?;
-    pause(2500);
+    pause(2000);
     drop(app);
     Ok(())
 }

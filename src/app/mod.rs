@@ -40,6 +40,7 @@ enum Action {
     Theme(String),
     Save,
     Palette,
+    Sidebar,
 }
 #[derive(Clone)]
 enum PendingClose {
@@ -398,6 +399,7 @@ impl App {
                 };
             }
             Action::Settings => self.settings = true,
+            Action::Sidebar => self.state.preferences.sidebar = !self.state.preferences.sidebar,
             Action::Open => {
                 self.dialog = Some("Open file".into());
                 self.dialog_input = self.cwd().display().to_string() + "/";
@@ -439,6 +441,7 @@ impl App {
             ("SSH connection".into(), Action::Connect),
             ("Launch Codex".into(), Action::Assistant("codex".into())),
             ("Launch Claude".into(), Action::Assistant("claude".into())),
+            ("Toggle sidebar".into(), Action::Sidebar),
             ("Appearance and settings".into(), Action::Settings),
         ];
         for (id, t) in &self.presets {
@@ -457,6 +460,7 @@ impl App {
         };
         for (m, key, a) in [
             (cs, Key::P, Action::Palette),
+            (cs, Key::B, Action::Sidebar),
             (cs, Key::T, Action::NewTab),
             (cs, Key::D, Action::Split(Axis::Horizontal)),
             (cs, Key::E, Action::Split(Axis::Vertical)),
@@ -972,7 +976,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(theme.ui("background"))
-                    .inner_margin(8.),
+                    .inner_margin(6.),
             )
             .show(ctx, |ui| {
                 self.tabs(ui, ctx);

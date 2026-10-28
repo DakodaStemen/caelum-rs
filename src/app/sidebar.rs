@@ -1,4 +1,4 @@
-use super::panes::{badge, dot};
+use super::panes::{badge, dot, menu_button};
 use super::*;
 
 impl App {
@@ -8,14 +8,20 @@ impl App {
                 egui::Frame::new()
                     .fill(theme.ui("chrome"))
                     .stroke(Stroke::new(1_f32, theme.ui("border")))
-                    .inner_margin(egui::Margin::symmetric(14, 9)),
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if menu_button(ui, theme, self.state.preferences.sidebar)
+                        .on_hover_text("Toggle sidebar (Ctrl+Shift+B)")
+                        .clicked()
+                    {
+                        self.action(Action::Sidebar, ctx);
+                    }
                     ui.image((self.logo.id(), Vec2::splat(24.)));
                     ui.label(
                         RichText::new("Caelum")
-                            .size(18.)
+                            .size(16.)
                             .strong()
                             .color(theme.ui("textStrong")),
                     );
@@ -109,7 +115,7 @@ impl App {
                     .stroke(Stroke::new(1_f32, theme.ui("border")))
                     .inner_margin(egui::Margin::same(12)),
             )
-            .show(ctx, |ui| {
+            .show_animated(ctx, self.state.preferences.sidebar, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.;
                 section(ui, theme, "WORKSPACES");
                 let workspaces: Vec<_> = self

@@ -338,6 +338,37 @@ impl App {
         ui.label("Embedded browsing is pending. The link is preserved in this workspace.");
     }
 }
+/// Three-bar menu toggle drawn directly so it needs no icon font.
+pub(super) fn menu_button(ui: &mut egui::Ui, theme: &Theme, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28_f32), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Toggle sidebar")
+    });
+    let fill = if open {
+        theme.ui("tabActive")
+    } else if response.hovered() {
+        theme.ui("surface")
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 7, fill);
+    let color = if open || response.hovered() {
+        theme.ui("accent")
+    } else {
+        theme.ui("textSecondary")
+    };
+    for dy in [-5_f32, 0., 5.] {
+        let y = rect.center().y + dy;
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.center().x - 7., y),
+                Pos2::new(rect.center().x + 7., y),
+            ],
+            Stroke::new(1.8_f32, color),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 pub(super) fn dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.), Sense::hover());
     ui.painter().circle_filled(rect.center(), 3.5, color);

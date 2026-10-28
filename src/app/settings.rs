@@ -46,6 +46,8 @@ impl App {
         let mut cancel_draft = false;
         egui::Window::new("Appearance")
             .open(&mut open)
+            .default_pos(ctx.content_rect().center())
+            .pivot(egui::Align2::CENTER_CENTER)
             .default_width(650.)
             .max_height(650.)
             .show(ctx, |ui| {
@@ -62,9 +64,11 @@ impl App {
                                 ui.selectable_value(&mut t.kind, "light".into(), "Light");
                             });
                         ui.separator();
-                        for (name, values) in
-                            [("Interface", &mut t.ui), ("Terminal", &mut t.terminal)]
-                        {
+                        for (name, values) in [
+                            ("Code", &mut t.syntax),
+                            ("Interface", &mut t.ui),
+                            ("Terminal", &mut t.terminal),
+                        ] {
                             ui.strong(name);
                             egui::Grid::new(name).num_columns(2).show(ui, |ui| {
                                 for (key, value) in values {

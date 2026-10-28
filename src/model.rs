@@ -255,6 +255,8 @@ pub struct Preferences {
     pub line_height: f32,
     pub cursor_style: String,
     pub cursor_blink: bool,
+    /// Whether the workspace sidebar is shown; hidden by default for a minimal window.
+    pub sidebar: bool,
     pub custom_themes: Vec<crate::theme::Theme>,
 }
 impl Default for Preferences {
@@ -266,6 +268,7 @@ impl Default for Preferences {
             line_height: 1.2,
             cursor_style: "block".into(),
             cursor_blink: false,
+            sidebar: false,
             custom_themes: vec![],
         }
     }
