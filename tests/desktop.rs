@@ -450,19 +450,8 @@ fn main() {
     };
     pause(1500);
     k.click(500, 300)?;
-    run("ls -la --color=always")?;
-    run("echo 'Native Rust terminal - egui + Alacritty core'")?;
-    k.shortcut('d' as u32)?;
-    pause(600);
-    run("seq 1 5 | sed 's/^/step /'")?;
+    run("printf '\\033[31mred  \\033[32mgreen  \\033[34mblue\\033[0m\\n'")?;
     pause(1200);
-    k.shortcut('e' as u32)?;
-    pause(600);
-    run("printf '\\033[31mred \\033[32mgreen \\033[34mblue\\033[0m\\n'")?;
-    k.shortcut(0xff0d)?;
-    pause(1200);
-    k.shortcut(0xff0d)?;
-    pause(800);
     let ctrl = k.key(0xffe3)?.0;
     k.event(ctrl, true)?;
     k.press('o' as u32)?;
@@ -477,22 +466,45 @@ fn main() {
     pause(1200);
     k.shortcut(0xff0d)?;
     pause(1500);
-    for theme in [
-        "Orbit",
-        "Nebula",
-        "Mars",
-        "Aurora",
-        "Dawn",
-        "Lunar",
-        "Starlight",
-    ] {
+    let theme = |name: &str, wait: u64| -> Result<()> {
         k.shortcut('p' as u32)?;
         pause(500);
-        k.type_text(&format!("Theme: {theme}"))?;
+        k.type_text(&format!("Theme: {name}"))?;
         pause(600);
         k.press(0xff0d)?;
-        pause(1300);
+        pause(wait);
+        Ok(())
+    };
+    for name in ["Orbit", "Mars", "Aurora", "Dawn", "Lunar", "Starlight"] {
+        theme(name, 1300)?;
     }
+    theme("Nebula", 1500)?;
+    // Edit in the pane: add a comment, then save with the pane's own Save button.
+    let geometry = k.connection.get_geometry(k.window)?.reply()?;
+    let width = geometry.width as i16;
+    k.click(width / 2, 420)?;
+    k.event(ctrl, true)?;
+    k.press(0xff50)?;
+    k.event(ctrl, false)?;
+    pause(400);
+    for c in "// Saved straight from the pane".chars() {
+        k.type_text(&c.to_string())?;
+        pause(60);
+    }
+    k.press(0xff0d)?;
+    pause(1200);
+    k.click(276, 163)?;
+    pause(1800);
+    // Close the pane with its own button, back to the terminal.
+    k.click(width - 18, 117)?;
+    pause(1500);
+    k.click(width / 2, 300)?;
+    run(
+        "for i in $(seq 0 3 255); do printf \"\\033[48;2;%d;%d;255m \\033[0m\" $i $((255-i)); done; echo",
+    )?;
+    pause(1200);
+    run("echo 'Saved and shipped with Caelum.'")?;
+    pause(2500);
     drop(app);
     Ok(())
 }
