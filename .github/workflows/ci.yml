@@ -1,0 +1,28 @@
+name: Rust
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: xvfb-run -a cargo test --locked --test desktop -- --ignored --nocapture
+      - run: |
+          mkdir -p .runtime
+          xvfb-run -a cargo run --locked -- --smoke-test "$PWD/.runtime/desktop.json"
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-validation
+          path: .runtime/

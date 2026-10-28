@@ -1,0 +1,30 @@
+[package]
+name = "caelum-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native Rust workspace terminal. Your space to build."
+license = "MIT"
+repository = "https://github.com/DakodaStemen/caelum-rs"
+
+[dependencies]
+alacritty_terminal = "=0.26.0"
+anyhow = "1"
+ab_glyph = "0.2"
+eframe = { version = "0.33", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "accesskit"] }
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }
+
+[profile.release]
+lto = "thin"
+strip = true
