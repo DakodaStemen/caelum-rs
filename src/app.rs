@@ -846,43 +846,205 @@ impl App {
         child.set_clip_rect(rect);
         egui::Frame::new().fill(theme.term("background")).stroke(Stroke::new(1_f32,if selected{theme.ui("accent")}else{theme.ui("border")})).show(&mut child,|ui|{
    ui.set_min_size((rect.size()-Vec2::splat(4.)).max(Vec2::splat(1.)));ui.set_max_size((rect.size()-Vec2::splat(4.)).max(Vec2::splat(1.)));
-   ui.horizontal(|ui|{let label=match &*node {Pane::Terminal{..}=>self.terminals.get(&id).map(|s|s.title.clone()).unwrap_or_else(||"Terminal".into()),Pane::Files{..}=>"Files".into(),Pane::Editor{path,..}=>path.file_name().unwrap_or_default().to_string_lossy().to_string(),Pane::System{..}=>"System".into(),Pane::Processes{..}=>"Processes".into(),Pane::Browser{..}=>"Browser link".into(),_=>String::new()};
+   ui.horizontal(|ui|{
+let label=match &*node {
+Pane::Terminal{
+..
+}=>self.terminals.get(&id).map(|s|s.title.clone()).unwrap_or_else(||"Terminal".into()),Pane::Files{
+..
+}=>"Files".into(),Pane::Editor{
+path,..
+}=>path.file_name().unwrap_or_default().to_string_lossy().to_string(),Pane::System{
+..
+}=>"System".into(),Pane::Processes{
+..
+}=>"Processes".into(),Pane::Browser{
+..
+}=>"Browser link".into(),_=>String::new()
+};
+
     let kind=match &*node {Pane::Terminal{..}=>"shell",Pane::Files{..}=>"files",Pane::Editor{..}=>"editor",Pane::System{..}=>"system",Pane::Processes{..}=>"processes",Pane::Browser{..}=>"link",_=>""};
     dot(ui,if selected{theme.ui("accent")}else{theme.ui("borderStrong")});
     let title=RichText::new(label).small().color(if selected{theme.ui("textStrong")}else{theme.ui("textSecondary")});
     if ui.add(egui::Label::new(if selected{title.strong()}else{title}).truncate().sense(Sense::click())).clicked(){focus_requested=true;}
     if self.documents.get(&id).is_some_and(Document::dirty) && matches!(&*node,Pane::Editor{..}){ui.colored_label(theme.syn("number"),"● unsaved");}
     ui.label(RichText::new(kind).size(10.).color(theme.ui("muted")));
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.add(egui::Button::new("×").frame(false).small()).on_hover_text("Close pane (Ctrl+Shift+W)").clicked(){self.focused=id.clone();self.pending=Some(PendingClose::Pane);}
-if ui.add(egui::Button::new("Zoom").frame(false).small()).on_hover_text("Zoom or restore (Ctrl+Shift+Enter)").clicked(){self.focused=id.clone();self.zoom=if self.zoom.is_some(){None}else{Some(id.clone())};}});});
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+if ui.add(egui::Button::new("×").frame(false).small()).on_hover_text("Close pane (Ctrl+Shift+W)").clicked(){
+self.focused=id.clone();
+self.pending=Some(PendingClose::Pane);
+
+}
+if ui.add(egui::Button::new("Zoom").frame(false).small()).on_hover_text("Zoom or restore (Ctrl+Shift+Enter)").clicked(){
+self.focused=id.clone();
+self.zoom=if self.zoom.is_some(){
+None
+}else{
+Some(id.clone())
+};
+
+}
+});
+
+});
+
    ui.separator();match node {
     Pane::Terminal{cwd,command,..}=>{
-     if !self.terminals.contains_key(&id){let test_command=vec!["/usr/bin/env".into(),"HISTFILE=/dev/null".into(),"PS1=$ ".into(),"/bin/bash".into(),"--noprofile".into(),"--norc".into(),"-i".into()];match Session::spawn(cwd,if self.smoke.is_some(){Some(test_command.as_slice())}else{command.as_deref()},ctx.clone()){Ok(s)=>{self.terminals.insert(id.clone(),s);},Err(e)=>{ui.colored_label(theme.ui("danger"),format!("Cannot open terminal: {e}"));return;}}}
+     if !self.terminals.contains_key(&id){
+let test_command=vec!["/usr/bin/env".into(),"HISTFILE=/dev/null".into(),"PS1=$ ".into(),"/bin/bash".into(),"--noprofile".into(),"--norc".into(),"-i".into()];
+match Session::spawn(cwd,if self.smoke.is_some(){
+Some(test_command.as_slice())
+}else{
+command.as_deref()
+},ctx.clone()){
+Ok(s)=>{
+self.terminals.insert(id.clone(),s);
+
+},Err(e)=>{
+ui.colored_label(theme.ui("danger"),format!("Cannot open terminal: {e}"));
+return;
+
+}
+}
+}
      let session=self.terminals.get_mut(&id).unwrap();let allow_input=selected && !self.palette && !self.settings && self.dialog.is_none() && self.pending.is_none();
      let search=if self.dialog.as_deref()==Some("Search terminal"){self.dialog_input.as_str()}else{""};
      if terminal::show(ui,session,theme,&self.state.preferences,allow_input,search){focus_requested=true;}*cwd=session.cwd.clone();if let Some(error)=session.error.take(){self.message=error;}
     },
     Pane::Files{path,..}=>{
-     let view=self.files.entry(id.clone()).or_default();if view.loaded.as_ref()!=Some(path) || view.refreshed.is_none_or(|t|t.elapsed()>Duration::from_secs(2)){if view.loaded.as_ref()!=Some(path){view.path_input=path.display().to_string();}match files::list(path,&view.filter){Ok(entries)=>{view.entries=entries;view.error.clear();},Err(e)=>view.error=e.to_string()}view.loaded=Some(path.clone());view.refreshed=Some(Instant::now());}
-     ui.horizontal(|ui|{if ui.small_button("Up").clicked()&& let Some(parent)=path.parent(){*path=parent.to_path_buf();}let edit=ui.add(egui::TextEdit::singleline(&mut view.path_input).desired_width(ui.available_width()));if edit.lost_focus() && ui.input(|i|i.key_pressed(Key::Enter)){let requested=PathBuf::from(&view.path_input);*path=if requested.is_absolute(){requested}else{path.join(requested)};}});
+     let view=self.files.entry(id.clone()).or_default();
+if view.loaded.as_ref()!=Some(path) || view.refreshed.is_none_or(|t|t.elapsed()>Duration::from_secs(2)){
+if view.loaded.as_ref()!=Some(path){
+view.path_input=path.display().to_string();
+
+}match files::list(path,&view.filter){
+Ok(entries)=>{
+view.entries=entries;
+view.error.clear();
+
+},Err(e)=>view.error=e.to_string()
+}view.loaded=Some(path.clone());
+view.refreshed=Some(Instant::now());
+
+}
+     ui.horizontal(|ui|{
+if ui.small_button("Up").clicked()&& let Some(parent)=path.parent(){
+*path=parent.to_path_buf();
+
+}let edit=ui.add(egui::TextEdit::singleline(&mut view.path_input).desired_width(ui.available_width()));
+if edit.lost_focus() && ui.input(|i|i.key_pressed(Key::Enter)){
+let requested=PathBuf::from(&view.path_input);
+*path=if requested.is_absolute(){
+requested
+}else{
+path.join(requested)
+};
+
+}
+});
+
      if ui.add(egui::TextEdit::singleline(&mut view.filter).hint_text("Filter files…")).changed(){view.refreshed=None;}
 if !view.error.is_empty(){ui.colored_label(theme.ui("danger"),&view.error);}let mut open=None;
-     egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{for entry in &view.entries{let label=RichText::new(format!("{}  {}",if entry.directory{"▸"}else{"·"},entry.name)).color(if entry.directory{theme.syn("function")}else{theme.ui("text")});let response=ui.selectable_label(false,label);if response.double_clicked(){if entry.directory{*path=entry.path.clone();}else{open=Some(entry.path.clone());}}}});
+     egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{
+for entry in &view.entries{
+let label=RichText::new(format!("{}  {}",if entry.directory{
+"▸"
+}else{
+"·"
+},entry.name)).color(if entry.directory{
+theme.syn("function")
+}else{
+theme.ui("text")
+});
+let response=ui.selectable_label(false,label);
+if response.double_clicked(){
+if entry.directory{
+*path=entry.path.clone();
+
+}else{
+open=Some(entry.path.clone());
+
+}
+}
+}
+});
+
      if let Some(path)=open{self.pending_open=Some(path);}
     },
     Pane::Editor{path,..}=>{
      if !self.documents.contains_key(&id){match Document::open(path){Ok(doc)=>{self.documents.insert(id.clone(),doc);},Err(e)=>{ui.colored_label(theme.ui("danger"),e.to_string());return;}}}
      let language=self.syntax.language(path).unwrap_or_else(||"Plain text".into());
      let doc=self.documents.get_mut(&id).unwrap();ui.horizontal(|ui|{if ui.add_enabled(!doc.read_only && doc.dirty(),egui::Button::new("Save  Ctrl+S")).clicked(){self.pending_save=Some(id.clone());}
-if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read only");}badge(ui,theme,&language,theme.syn("function"));ui.label(RichText::new(format!("{} lines",doc.text.lines().count().max(1))).small().color(theme.ui("muted")));ui.label(RichText::new(doc.path.display().to_string()).small().color(theme.ui("muted")));});
+if doc.read_only{
+ui.colored_label(theme.ui("danger"),"Unknown encoding · read only");
+
+}badge(ui,theme,&language,theme.syn("function"));
+ui.label(RichText::new(format!("{} lines",doc.text.lines().count().max(1))).small().color(theme.ui("muted")));
+ui.label(RichText::new(doc.path.display().to_string()).small().color(theme.ui("muted")));
+
+});
+
      let font=FontId::monospace(self.state.preferences.font_size);let doc_path=doc.path.clone();let syntax=&mut self.syntax;
      let mut layouter=|ui:&egui::Ui,text:&dyn egui::TextBuffer,wrap:f32|{let job=syntax.job(&doc_path,text.as_str(),theme,font.clone(),wrap);ui.fonts_mut(|f|f.layout_job(job))};
      let edit=egui::TextEdit::multiline(&mut doc.text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(!doc.read_only).code_editor().layouter(&mut layouter);
      egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{if ui.add_sized(ui.available_size().max(Vec2::new(1.,100.)),edit).has_focus(){focus_requested=true;}});
     },
-    Pane::System{..}=>{self.system.refresh();egui::ScrollArea::vertical().show(ui,|ui|{ui.add_space(16.);for (name,value) in [("LOAD AVERAGE",&self.system.load),("MEMORY",&self.system.memory),("UPTIME",&self.system.uptime)]{ui.label(RichText::new(name).small().color(theme.ui("muted")));ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));ui.add_space(20.);}ui.label(format!("{} logical CPUs",std::thread::available_parallelism().map(usize::from).unwrap_or(1)));ui.label(std::env::consts::OS);});},
-    Pane::Processes{..}=>{self.system.refresh();ui.add(egui::TextEdit::singleline(&mut self.process_filter).hint_text("Filter name or PID…"));let filter=self.process_filter.to_lowercase();egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{egui::Grid::new(("processes",&id)).striped(true).show(ui,|ui|{ui.strong("PID");ui.strong("Process");ui.strong("RSS");ui.end_row();for (pid,name,rss) in &self.system.processes{if name.to_lowercase().contains(&filter)||pid.contains(&filter){ui.monospace(pid);ui.label(name);ui.label(rss);ui.end_row();}}});});},
-    Pane::Browser{url,..}=>{ui.label("Imported browser link");ui.text_edit_singleline(url);if ui.button("Open in system browser").clicked()&& (url.starts_with("https://")||url.starts_with("http://")){ctx.open_url(egui::OpenUrl::new_tab(url.clone()));}ui.label("Embedded browsing is pending. The link is preserved in this workspace.");},_=>{}
+    Pane::System{
+..
+}=>{
+self.system.refresh();
+egui::ScrollArea::vertical().show(ui,|ui|{
+ui.add_space(16.);
+for (name,value) in [("LOAD AVERAGE",&self.system.load),("MEMORY",&self.system.memory),("UPTIME",&self.system.uptime)]{
+ui.label(RichText::new(name).small().color(theme.ui("muted")));
+ui.label(RichText::new(value).size(23.).color(theme.ui("accent")));
+ui.add_space(20.);
+
+}ui.label(format!("{} logical CPUs",std::thread::available_parallelism().map(usize::from).unwrap_or(1)));
+ui.label(std::env::consts::OS);
+
+});
+
+},
+    Pane::Processes{
+..
+}=>{
+self.system.refresh();
+ui.add(egui::TextEdit::singleline(&mut self.process_filter).hint_text("Filter name or PID…"));
+let filter=self.process_filter.to_lowercase();
+egui::ScrollArea::both().auto_shrink([false,false]).show(ui,|ui|{
+egui::Grid::new(("processes",&id)).striped(true).show(ui,|ui|{
+ui.strong("PID");
+ui.strong("Process");
+ui.strong("RSS");
+ui.end_row();
+for (pid,name,rss) in &self.system.processes{
+if name.to_lowercase().contains(&filter)||pid.contains(&filter){
+ui.monospace(pid);
+ui.label(name);
+ui.label(rss);
+ui.end_row();
+
+}
+}
+});
+
+});
+
+},
+    Pane::Browser{
+url,..
+}=>{
+ui.label("Imported browser link");
+ui.text_edit_singleline(url);
+if ui.button("Open in system browser").clicked()&& (url.starts_with("https://")||url.starts_with("http://")){
+ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+
+}ui.label("Embedded browsing is pending. The link is preserved in this workspace.");
+
+},_=>{
+
+}
    }
   });
         if focus_requested {
