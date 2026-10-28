@@ -8,6 +8,8 @@
 <h1 align="center">Caelum · Rust</h1>
 <p align="center"><strong>Your space to build.</strong><br>A native workspace terminal, built in Rust.</p>
 
+<p align="center"><img src="docs/demo.gif" width="100%" alt="Caelum Rust running shell commands, splitting panes right and below, zooming one, and switching between the Orbit, Aurora, Dawn and Starlight themes"></p>
+
 <p align="center"><img src="docs/desktop.png" width="100%" alt="Caelum Rust with live terminal splits and a file browser"></p>
 
 **An early, working native rewrite of [Caelum](https://github.com/DakodaStemen/caelum).**
@@ -117,6 +119,8 @@ cargo test --locked --test desktop -- --ignored --nocapture
 
 The smoke test writes a JSON report and PNG screenshot. It drives real PTYs and
 native application actions; the separate XTest test drives real window input.
+`scripts/record-demo.sh` regenerates `docs/demo.gif` by playing a scripted session
+through the same real X11 input path under Xvfb.
 Neither test uses your normal Caelum profile or shell initialization files.
 
 See [architecture](docs/architecture.md), [migration coverage](docs/migration.md),

@@ -369,3 +369,76 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     restarted.0.wait()?;
     Ok(())
 }
+/// Plays a paced session for README recording; run under Xvfb with `ffmpeg -f x11grab` capturing.
+#[test]
+#[ignore = "demo recording: scripts/record-demo.sh"]
+fn record_demo() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let profile = dir.path().join("profile");
+    fs::create_dir(&profile)?;
+    let shell = dir.path().join("shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nexport HISTFILE=/dev/null PS1='\\033[35m❯\\033[0m '\nexec /bin/bash --noprofile --norc -i\n",
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700))?;
+    let work = dir.path().join("caelum-rs");
+    fs::create_dir(&work)?;
+    fs::write(work.join("README.md"), "# caelum-rs\n")?;
+    let mut state = caelum_rs::model::State::default();
+    state.workspaces[0].tabs[0].layout = caelum_rs::model::Pane::terminal(work.clone());
+    state.save(&profile.join("workspace.json"))?;
+    let mut app = AppChild(
+        Command::new(env!("CARGO_BIN_EXE_caelum-rs"))
+            .args(["--data-dir", profile.to_str().unwrap()])
+            .env_remove("WAYLAND_DISPLAY")
+            .env("SHELL", &shell)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    let mut window = None;
+    wait(|| {
+        window = find_window(app.0.id()).ok().flatten();
+        window.is_some()
+    })?;
+    let k = Keyboard::new(window.unwrap())?;
+    k.focus()?;
+    let pause = |ms| thread::sleep(Duration::from_millis(ms));
+    let run = |cmd: &str| -> Result<()> {
+        for c in cmd.chars() {
+            k.type_text(&c.to_string())?;
+            pause(45);
+        }
+        pause(250);
+        k.press(0xff0d)?;
+        pause(1100);
+        Ok(())
+    };
+    pause(1500);
+    k.click(500, 300)?;
+    run("ls -la --color=always")?;
+    run("echo 'Native Rust terminal - egui + Alacritty core'")?;
+    k.shortcut('d' as u32)?;
+    pause(600);
+    run("seq 1 5 | sed 's/^/step /'")?;
+    pause(1200);
+    k.shortcut('e' as u32)?;
+    pause(600);
+    run("printf '\\033[31mred \\033[32mgreen \\033[34mblue\\033[0m\\n'")?;
+    k.shortcut(0xff0d)?;
+    pause(1200);
+    k.shortcut(0xff0d)?;
+    pause(800);
+    for theme in ["Orbit", "Aurora", "Dawn", "Starlight"] {
+        k.shortcut('p' as u32)?;
+        pause(500);
+        k.type_text(&format!("Theme: {theme}"))?;
+        pause(600);
+        k.press(0xff0d)?;
+        pause(1300);
+    }
+    drop(app);
+    Ok(())
+}
