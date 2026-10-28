@@ -34,6 +34,7 @@ enum Action {
     Theme(String),
     Save,
     Palette,
+    Sidebar,
 }
 #[derive(Clone)]
 enum PendingClose {
@@ -424,6 +425,7 @@ impl App {
                 };
             }
             Action::Settings => self.settings = true,
+            Action::Sidebar => self.state.preferences.sidebar = !self.state.preferences.sidebar,
             Action::Open => {
                 self.dialog = Some("Open file".into());
                 self.dialog_input = self.cwd().display().to_string() + "/";
@@ -465,6 +467,7 @@ impl App {
             ("SSH connection".into(), Action::Connect),
             ("Launch Codex".into(), Action::Assistant("codex".into())),
             ("Launch Claude".into(), Action::Assistant("claude".into())),
+            ("Toggle sidebar".into(), Action::Sidebar),
             ("Appearance and settings".into(), Action::Settings),
         ];
         for (id, t) in &self.presets {
@@ -483,6 +486,7 @@ impl App {
         };
         for (m, key, a) in [
             (cs, Key::P, Action::Palette),
+            (cs, Key::B, Action::Sidebar),
             (cs, Key::T, Action::NewTab),
             (cs, Key::D, Action::Split(Axis::Horizontal)),
             (cs, Key::E, Action::Split(Axis::Vertical)),
@@ -537,14 +541,20 @@ impl App {
                 egui::Frame::new()
                     .fill(theme.ui("chrome"))
                     .stroke(Stroke::new(1_f32, theme.ui("border")))
-                    .inner_margin(egui::Margin::symmetric(14, 9)),
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.image((self.logo.id(), Vec2::splat(30.)));
+                    if menu_button(ui, theme, self.state.preferences.sidebar)
+                        .on_hover_text("Toggle sidebar (Ctrl+Shift+B)")
+                        .clicked()
+                    {
+                        self.action(Action::Sidebar, ctx);
+                    }
+                    ui.image((self.logo.id(), Vec2::splat(24.)));
                     ui.label(
                         RichText::new("Caelum")
-                            .size(18.)
+                            .size(16.)
                             .strong()
                             .color(theme.ui("textStrong")),
                     );
@@ -638,7 +648,7 @@ impl App {
                     .stroke(Stroke::new(1_f32, theme.ui("border")))
                     .inner_margin(egui::Margin::same(12)),
             )
-            .show(ctx, |ui| {
+            .show_animated(ctx, self.state.preferences.sidebar, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.;
                 section(ui, theme, "WORKSPACES");
                 let workspaces: Vec<_> = self
@@ -1097,6 +1107,8 @@ if doc.read_only{ui.colored_label(theme.ui("danger"),"Unknown encoding · read o
         let mut cancel_draft = false;
         egui::Window::new("Appearance")
             .open(&mut open)
+            .default_pos(ctx.content_rect().center())
+            .pivot(egui::Align2::CENTER_CENTER)
             .default_width(650.)
             .max_height(650.)
             .show(ctx, |ui| {
@@ -1676,7 +1688,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(theme.ui("background"))
-                    .inner_margin(8.),
+                    .inner_margin(6.),
             )
             .show(ctx, |ui| {
                 self.tabs(ui, ctx);
@@ -1722,6 +1734,37 @@ impl eframe::App for App {
         self.persist();
         self.terminals.clear();
     }
+}
+/// Three-bar menu toggle drawn directly so it needs no icon font.
+fn menu_button(ui: &mut egui::Ui, theme: &Theme, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28_f32), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Toggle sidebar")
+    });
+    let fill = if open {
+        theme.ui("tabActive")
+    } else if response.hovered() {
+        theme.ui("surface")
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 7, fill);
+    let color = if open || response.hovered() {
+        theme.ui("accent")
+    } else {
+        theme.ui("textSecondary")
+    };
+    for dy in [-5_f32, 0., 5.] {
+        let y = rect.center().y + dy;
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.center().x - 7., y),
+                Pos2::new(rect.center().x + 7., y),
+            ],
+            Stroke::new(1.8_f32, color),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 fn dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.), Sense::hover());

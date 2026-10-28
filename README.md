@@ -32,6 +32,7 @@ not yet a feature-complete replacement, and no performance superiority is claime
 - Live Linux memory, load, uptime and process views.
 - SSH through your existing client and configuration; Codex and Claude commands
   can run in terminal panes when installed.
+- Minimal by default: the sidebar is hidden until you press Ctrl+Shift+B (or the ≡ button).
 - Command palette, separate settings profile, and optional legacy workspace import.
 
 ## Build and run
@@ -88,6 +89,7 @@ If a file changed on disk, conflicting recovery is archived in a
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+P | Command palette |
+| Ctrl+Shift+B | Show / hide the sidebar (hidden by default) |
 | Ctrl+Shift+T | New tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+D / E | Split right / below |

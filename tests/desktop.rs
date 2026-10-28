@@ -370,7 +370,7 @@ fn native_keyboard_splits_files_and_restart() -> Result<()> {
     Ok(())
 }
 /// Plays a paced session for README recording; run under Xvfb with `ffmpeg -f x11grab` capturing.
-const DEMO_CUSTOMIZE: (i16, i16) = (510, 425);
+const DEMO_CUSTOMIZE: (i16, i16) = (445, 405);
 #[test]
 #[ignore = "demo recording: scripts/record-demo.sh"]
 fn record_demo() -> Result<()> {
@@ -457,6 +457,11 @@ fn main() {
         "for i in $(seq 0 3 255); do printf \"\\033[48;2;%d;%d;255m \\033[0m\" $i $((255-i)); done; echo",
     )?;
     pause(960);
+    // The sidebar is hidden by default; flash it open and shut with one shortcut.
+    k.shortcut('b' as u32)?;
+    pause(1400);
+    k.shortcut('b' as u32)?;
+    pause(700);
     let ctrl = k.key(0xffe3)?.0;
     k.event(ctrl, true)?;
     k.press('o' as u32)?;
@@ -509,10 +514,10 @@ fn main() {
     }
     k.press(0xff0d)?;
     pause(960);
-    k.click(276, 163)?;
+    k.click(55, 154)?;
     pause(1440);
     // Close the pane with its own button, back to the terminal.
-    k.click(width - 18, 117)?;
+    k.click(width - 13, 106)?;
     pause(1200);
     k.click(width / 2, 300)?;
     run("echo 'Saved and shipped with Caelum.'")?;

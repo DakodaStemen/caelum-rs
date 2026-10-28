@@ -6,6 +6,9 @@
   CSS, shell, YAML, TOML and more), colored by each theme's new `syntax` palette.
 - The custom theme editor now includes the code (syntax) colors, listed first.
 - Orbit is the new default theme.
+- The sidebar is hidden by default for a minimal window; Ctrl+Shift+B or the header button
+  slides it in and out, and the choice is remembered. The header is slimmer too.
+- The Appearance window opens centered.
 - All ten themes rebuilt with richer accents, clearer surfaces and brighter terminal colors.
 - Interface overhaul: breadcrumb header, command-search pill, sidebar rows with hints and an
   active marker, tab chips with inline close, focus-aware pane headers, rounded controls,
