@@ -89,6 +89,7 @@ fn terminal_resize_reaches_pty_and_grid() {
     assert_eq!((term.columns(), term.screen_lines()), (2, 1));
 }
 
+#[cfg(unix)] // needs a POSIX shell; hangs on Windows runners
 #[test]
 fn terminal_scrollback_retains_history() {
     let mut s = spawn("seq 1 300; sleep 30");
@@ -101,6 +102,7 @@ fn terminal_scrollback_retains_history() {
     );
 }
 
+#[cfg(unix)] // needs a POSIX shell; hangs on Windows runners
 #[test]
 fn terminal_alt_screen_enter_and_leave() {
     let mut s = spawn(
@@ -118,6 +120,7 @@ fn terminal_alt_screen_enter_and_leave() {
     assert!(!s.text().contains("alt-text"));
 }
 
+#[cfg(unix)] // needs a POSIX shell; hangs on Windows runners
 #[test]
 fn terminal_wide_characters_occupy_two_cells_but_one_char() {
     let mut s = spawn("printf '日本a'; sleep 30");
