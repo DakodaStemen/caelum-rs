@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    branches: ['cross-platform']  # TEMP-TEST
   workflow_dispatch:
 permissions:
   contents: read
