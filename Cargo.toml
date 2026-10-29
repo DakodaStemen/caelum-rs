@@ -54,6 +54,9 @@ category = "DeveloperTool"
 icons = ["assets/brand/icon.png"]
 formats = ["all"]
 
+[package.metadata.packager.deb]
+package-name = "caelum-rs"
+
 [package.metadata.packager.wix]
 # MSI: unsigned unless a signing certificate is configured (see PACKAGING.md).
 
