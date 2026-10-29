@@ -4,11 +4,13 @@
 
 | OS | Artifacts |
 |----|-----------|
-| Linux (Debian/Ubuntu) | `.deb` (cargo-packager), AppImage |
+| Linux (Debian/Ubuntu) | `caelum-rs_<ver>_amd64.deb` (cargo-packager; install-tested in clean ubuntu:24.04), AppImage |
 | Linux (Fedora) | `.rpm` (cargo-generate-rpm) |
-| Linux (Arch) | `.pacman` package (cargo-packager) |
+| Linux (Arch) | `caelum-rs-<ver>-1-x86_64.pkg.tar.zst` (built with `makepkg` in an archlinux container) |
 | Windows | `.msi` (WiX), `.zip` |
-| macOS | universal (arm64 + x86_64) `.dmg` |
+| macOS | `Caelum_<ver>_universal.dmg` (arm64 + x86_64, verified with `lipo -info`) |
+
+The package/binary name is `caelum-rs` on every platform (deb, rpm, pacman).
 
 The workflow has not been exercised on a tag yet; run it via *workflow_dispatch* and check the artifacts before relying on it.
 
