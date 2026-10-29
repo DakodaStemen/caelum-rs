@@ -80,60 +80,11 @@ impl SystemInfo {
             return;
         }
         self.updated = Instant::now();
-        self.load = fs::read_to_string("/proc/loadavg")
-            .unwrap_or_default()
-            .split_whitespace()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("  ");
-        let mem = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let value = |key: &str| {
-            mem.lines()
-                .find(|l| l.starts_with(key))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-        };
-        let total = value("MemTotal:");
-        let used = total.saturating_sub(value("MemAvailable:"));
-        self.memory = format!(
-            "{:.1} / {:.1} GiB",
-            used as f64 / 1048576.,
-            total as f64 / 1048576.
-        );
-        let seconds = fs::read_to_string("/proc/uptime")
-            .unwrap_or_default()
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.) as u64;
-        self.uptime = format!("{}h {}m", seconds / 3600, seconds / 60 % 60);
-        self.processes.clear();
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for e in entries.flatten() {
-                let pid = e.file_name().to_string_lossy().to_string();
-                if pid.parse::<u32>().is_err() {
-                    continue;
-                }
-                let status = fs::read_to_string(e.path().join("status")).unwrap_or_default();
-                let name = status
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Name:\t"))
-                    .unwrap_or("")
-                    .to_string();
-                let rss = status
-                    .lines()
-                    .find_map(|l| l.strip_prefix("VmRSS:\t"))
-                    .unwrap_or("0 kB")
-                    .trim()
-                    .to_string();
-                if !name.is_empty() {
-                    self.processes.push((pid, name, rss));
-                }
-            }
-        }
-        self.processes
-            .sort_by_key(|p| p.0.parse::<u32>().unwrap_or(0));
+        let snap = caelum_rs::platform::system_snapshot();
+        self.load = snap.load;
+        self.memory = snap.memory;
+        self.uptime = snap.uptime;
+        self.processes = snap.processes;
     }
 }
 pub struct App {

@@ -1,0 +1,135 @@
+name: Release
+# Builds unsigned installers on version tags. See PACKAGING.md for signing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    # Pin to the oldest-supported LTS so the binary's glibc matches the ubuntu:24.04 install test.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev fontconfig libfuse2
+      - run: cargo install cargo-packager cargo-generate-rpm --locked
+      - run: cargo build --release --locked
+      - run: cargo packager --release --formats deb,appimage,pacman
+      - run: cargo generate-rpm
+      - run: |
+          mkdir -p dist
+          cp target/release/*.deb target/release/*.AppImage dist/
+          ls -l dist
+      - name: Verify deb installs in clean ubuntu:24.04
+        run: |
+          deb=$(ls "$PWD"/dist/*.deb)
+          dpkg-deb -f "$deb" Package | grep -qx caelum-rs
+          docker run --rm -v "$deb:/pkg.deb:ro" ubuntu:24.04 bash -euxc '
+            apt-get update
+            apt-get install -y /pkg.deb
+            dpkg -s caelum-rs
+            caelum-rs --version'
+      - name: Build real .pkg.tar.zst with makepkg (archlinux container)
+        run: |
+          set -eux
+          mkdir -p arch/src
+          tarball=$(ls target/release/*.tar.gz)
+          cp "$tarball" arch/src/caelum-rs.tar.gz
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          sum=$(sha512sum arch/src/caelum-rs.tar.gz | cut -d' ' -f1)
+          cat > arch/src/PKGBUILD <<EOF
+          pkgname=caelum-rs
+          pkgver=$ver
+          pkgrel=1
+          pkgdesc="A native workspace terminal built in Rust."
+          arch=('x86_64')
+          url="https://github.com/DakodaStemen/caelum-rs"
+          license=('MIT')
+          depends=('fontconfig' 'libxkbcommon' 'libx11' 'wayland')
+          options=(!lto !strip)
+          source=("caelum-rs.tar.gz")
+          noextract=("caelum-rs.tar.gz")
+          sha512sums=("$sum")
+          package() {
+            tar -xzf "\${srcdir}/caelum-rs.tar.gz" -C "\${pkgdir}"
+          }
+          EOF
+          cat arch/src/PKGBUILD
+          chmod -R a+rwX arch
+          docker run --rm -v "$PWD/arch/src:/build" archlinux:latest bash -euxc '
+            pacman -Syu --noconfirm base-devel
+            useradd -m builder
+            chown -R builder /build
+            cd /build
+            su builder -c "makepkg --nodeps --noconfirm"
+            pacman -U --noconfirm --nodeps ./*.pkg.tar.zst
+            pacman -Qi caelum-rs
+            pacman -Ql caelum-rs
+            caelum-rs --version'
+          mkdir -p dist
+          cp arch/src/*.pkg.tar.zst dist/
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          if-no-files-found: error
+          path: |
+            dist/*
+            target/generate-rpm/*.rpm
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: cargo install cargo-packager --locked
+      - run: cargo build --release --locked
+      - run: cargo packager --release --formats wix
+      - run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/*.msi dist/
+          Compress-Archive -Path target/release/caelum-rs.exe,LICENSE -DestinationPath dist/caelum-rs-windows-x86_64.zip
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: cargo install cargo-packager --locked
+      - run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/caelum-rs \
+            target/aarch64-apple-darwin/release/caelum-rs \
+            target/x86_64-apple-darwin/release/caelum-rs
+      - name: Verify universal binary
+        run: |
+          lipo -info target/release/caelum-rs
+          lipo -info target/release/caelum-rs | grep -q arm64
+          lipo -info target/release/caelum-rs | grep -q x86_64
+      - run: cargo packager --release --formats dmg
+      - name: Verify binary inside dmg is universal
+        run: |
+          yes | PAGER=cat hdiutil attach target/release/*.dmg -mountpoint /tmp/dmg -nobrowse >/dev/null
+          lipo -info /tmp/dmg/*.app/Contents/MacOS/*
+          hdiutil detach /tmp/dmg
+      - run: |
+          mkdir -p dist
+          for f in target/release/*.dmg; do
+            b=$(basename "$f"); cp "$f" "dist/${b/_aarch64/_universal}"
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-universal
+          path: dist/*
+          if-no-files-found: error
