@@ -118,6 +118,7 @@ pub struct App {
     last_dialog: Option<String>,
     pending_save: Option<String>,
     syntax: Highlighter,
+    writer: model::BackgroundWriter,
 }
 struct Smoke {
     report: PathBuf,
@@ -223,6 +224,7 @@ impl App {
             last_dialog: None,
             pending_save: None,
             syntax: Highlighter::default(),
+            writer: model::BackgroundWriter::new(),
         };
         app.restore_drafts();
         app.ensure_focus();
@@ -697,7 +699,7 @@ impl App {
         match pending {
             PendingClose::Window => {
                 self.allow_close = true;
-                self.persist();
+                self.persist_now();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             PendingClose::Workspace => {
@@ -802,7 +804,7 @@ impl App {
                     }
                     s.checks.push("New tab owns an independent terminal".into());
                     self.action(Action::Theme("graphite".into()), ctx);
-                    self.persist();
+                    self.persist_now();
                     let restored = State::read(&self.profile.join("workspace.json"))?;
                     if restored.preferences.theme != "graphite" {
                         bail!("Theme was not persisted");
@@ -886,7 +888,7 @@ impl App {
                     }
                     let report = serde_json::json!({"passed":s.checks,"profile":self.profile,"renderer":"native egui/OpenGL","success":true});
                     fs::write(&s.report, serde_json::to_vec_pretty(&report)?)?;
-                    self.persist();
+                    self.persist_now();
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return Ok(true);
@@ -966,6 +968,7 @@ impl eframe::App for App {
         if self.last_save.elapsed() > Duration::from_secs(3) {
             self.persist();
         }
+        self.report_write_errors();
         self.smoke_tick(ctx);
         ctx.request_repaint_after(Duration::from_millis(
             if self.state.preferences.cursor_blink {
@@ -976,7 +979,7 @@ impl eframe::App for App {
         ));
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist();
+        self.persist_now();
         self.terminals.clear();
     }
 }

@@ -71,12 +71,15 @@ impl App {
             }
         }
 
-        if let Err(e) = self.state.save(&self.profile.join("workspace.json")) {
-            self.message = format!("Workspace was not saved: {e}");
-            return;
-        }
-        if let Err(e) = restrict(&self.profile.join("workspace.json")) {
-            self.message = format!("Workspace permissions were not restricted: {e}");
+        // Serialise on the UI thread (cheap); the background writer does the file
+        // write and fsync so a slow disk never stalls a frame.
+        let mut batch = vec![];
+        match self.state.to_bytes() {
+            Ok(bytes) => batch.push((self.profile.join("workspace.json"), bytes)),
+            Err(e) => {
+                self.message = format!("Workspace was not saved: {e}");
+                return;
+            }
         }
         if !self.recovery_conflict {
             let drafts: Vec<_> = self
@@ -85,19 +88,26 @@ impl App {
                 .filter(|d| d.dirty())
                 .map(Document::draft)
                 .collect();
-            let result = (|| -> Result<()> {
-                let mut temp = tempfile::NamedTempFile::new_in(&self.profile)?;
-                temp.write_all(&serde_json::to_vec_pretty(&drafts)?)?;
-                restrict(temp.path())?;
-                temp.as_file().sync_all()?;
-                temp.persist(self.profile.join("drafts.json"))?;
-                Ok(())
-            })();
-            if let Err(e) = result {
-                self.message = format!("Recovery was not saved: {e}");
+            match serde_json::to_vec_pretty(&drafts) {
+                Ok(bytes) => batch.push((self.profile.join("drafts.json"), bytes)),
+                Err(e) => self.message = format!("Recovery was not saved: {e}"),
             }
         }
+        self.writer.submit(batch);
         self.last_save = Instant::now();
+    }
+    /// Persists and waits until the files are on disk (exit and smoke checks).
+    pub(super) fn persist_now(&mut self) {
+        self.persist();
+        self.writer.flush();
+        self.report_write_errors();
+    }
+    /// Surfaces failures from the background writer in the status line.
+    pub(super) fn report_write_errors(&mut self) {
+        for e in self.writer.take_errors() {
+            eprintln!("caelum-rs: {e}");
+            self.message = e;
+        }
     }
     pub(super) fn restore_drafts(&mut self) {
         let file = self.profile.join("drafts.json");
