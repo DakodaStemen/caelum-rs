@@ -220,6 +220,8 @@ pub struct App {
     font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     last_dialog: Option<String>,
     pending_save: Option<String>,
+    /// Multi-line paste awaiting confirmation (see `terminal_pane::paste_confirm`).
+    pending_paste: Option<terminal_pane::PendingPaste>,
     syntax: Highlighter,
     config_path: PathBuf,
     config: Config,
@@ -332,6 +334,7 @@ impl App {
             font_rx: None,
             last_dialog: None,
             pending_save: None,
+            pending_paste: None,
             syntax: Highlighter::default(),
             config_path,
             config: Config::default(),
@@ -667,6 +670,9 @@ impl App {
         }
         if self.settings {
             self.appearance(ctx);
+        }
+        if self.pending_paste.is_some() {
+            self.paste_confirm(ctx);
         }
         if let Some(title) = self.dialog.clone() {
             let mut done = false;

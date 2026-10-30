@@ -171,6 +171,56 @@ fn terminal_burst_input_is_fully_retained_in_order() {
     assert!(s.error.is_none(), "{:?}", s.error);
 }
 
+/// A multi-line paste into a program without bracketed paste is held until
+/// confirmed; a bracketed-paste program receives it immediately.
+#[cfg(unix)]
+#[test]
+fn terminal_multiline_paste_is_held_unless_bracketed() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.txt");
+    let mut s = spawn(&format!(
+        "stty -echo; echo ready; cat > '{}'; echo finished; sleep 30",
+        plain.display()
+    ));
+    wait(&mut s, "ready", |s| s.text().contains("ready"));
+    assert!(s.paste_or_hold("echo one\necho two\n", true));
+    // A single line is never held.
+    assert!(!s.paste_or_hold("single line", true));
+    let held = s.take_pending_paste().expect("paste held");
+    assert_eq!(held, "echo one\necho two\n");
+    assert!(s.take_pending_paste().is_none());
+    // The user confirms: the held text is written with line breaks as Enter.
+    s.paste(&held);
+    s.write(vec![0x04]);
+    wait(&mut s, "cat to finish", |s| s.text().contains("finished"));
+    assert_eq!(
+        fs::read_to_string(&plain).unwrap(),
+        "single lineecho one\necho two\n"
+    );
+
+    let bracketed = dir.path().join("bracketed.txt");
+    let mut s = spawn(&format!(
+        "stty -echo; printf '\\033[?2004h'; cat > '{}'; echo finished; sleep 30",
+        bracketed.display()
+    ));
+    wait(&mut s, "bracketed paste mode", |s| {
+        s.term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE)
+    });
+    assert!(!s.paste_or_hold("a\nb", true));
+    assert!(s.take_pending_paste().is_none());
+    s.write(b"\r".to_vec());
+    s.write(vec![0x04]);
+    wait(&mut s, "cat to finish", |s| s.text().contains("finished"));
+    assert_eq!(
+        fs::read_to_string(&bracketed).unwrap(),
+        "\x1b[200~a\nb\x1b[201~\n"
+    );
+}
+
 #[test]
 fn terminal_oversized_input_sets_error_instead_of_growing() {
     let mut s = spawn("sleep 30");

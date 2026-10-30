@@ -185,6 +185,8 @@ pub struct Session {
     size: Size,
     search_origin: Option<(String, Point)>,
     pending_input: Vec<u8>,
+    /// Multi-line paste held for user confirmation (already sanitised).
+    pending_paste: Option<String>,
     wake: egui::Context,
 }
 impl Session {
@@ -286,6 +288,7 @@ impl Session {
             size,
             search_origin: None,
             pending_input: Vec::new(),
+            pending_paste: None,
             wake: ctx,
         })
     }
@@ -319,9 +322,29 @@ impl Session {
             }
         }
     }
+    /// Writes a paste to the PTY now, bracketed if the program enabled it.
     pub fn paste(&mut self, text: &str) {
-        let bracketed = lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE);
+        let bracketed = self.bracketed_paste();
         self.write(paste_bytes(text, bracketed));
+    }
+    /// Pastes like [`Session::paste`], unless [`needs_confirm`] says the user should
+    /// see it first; then it is held until [`Session::take_pending_paste`].
+    /// Returns true when the paste was held.
+    pub fn paste_or_hold(&mut self, text: &str, confirm_multiline: bool) -> bool {
+        if needs_confirm(text, self.bracketed_paste(), confirm_multiline) {
+            self.pending_paste = Some(sanitize_paste(text));
+            true
+        } else {
+            self.paste(text);
+            false
+        }
+    }
+    /// The held multi-line paste, if any, for the app to confirm.
+    pub fn take_pending_paste(&mut self) -> Option<String> {
+        self.pending_paste.take()
+    }
+    fn bracketed_paste(&self) -> bool {
+        lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE)
     }
     pub fn poll(&mut self, theme: &Theme) {
         self.flush_input();
@@ -612,6 +635,48 @@ fn wait_readable(fd: &std::os::fd::OwnedFd, timeout: Duration) {
     unsafe {
         libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int);
     }
+}
+/// Whether a paste must be confirmed before it reaches the PTY: without bracketed
+/// paste every line break acts as Enter, so a multi-line paste can run commands the
+/// user never saw. Bracketed-paste programs (and users who opted out) paste at once.
+pub fn needs_confirm(text: &str, bracketed: bool, confirm_multiline: bool) -> bool {
+    confirm_multiline && !bracketed && sanitize_paste(text).contains(['\n', '\r'])
+}
+/// Lines shown in the paste confirmation preview.
+const PREVIEW_LINES: usize = 5;
+const PREVIEW_LINE_CHARS: usize = 120;
+/// Line count and a safe preview of a held paste: the first [`PREVIEW_LINES`]
+/// lines with controls and bidi characters escaped, long lines shortened.
+pub fn paste_preview(text: &str) -> (usize, String) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut preview: Vec<String> = lines
+        .iter()
+        .take(PREVIEW_LINES)
+        .map(|line| {
+            let escaped: String = line
+                .chars()
+                .flat_map(|c| {
+                    if c.is_control() || is_bidi_control(c) {
+                        c.escape_default().collect::<Vec<_>>()
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            if escaped.chars().count() > PREVIEW_LINE_CHARS {
+                let head: String = escaped.chars().take(PREVIEW_LINE_CHARS).collect();
+                format!("{head}…")
+            } else {
+                escaped
+            }
+        })
+        .collect();
+    if lines.len() > PREVIEW_LINES {
+        preview.push(format!("… {} more line(s)", lines.len() - PREVIEW_LINES));
+    }
+    (lines.len(), preview.join("\n"))
 }
 /// Bytes sent to the PTY for a paste, after sanitising and optional bracketing.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
@@ -933,7 +998,7 @@ pub fn show(
     handle_links(ui, s, &response, &m, pointer);
     handle_scroll(ui, s, &response, &m, pointer);
     if focused && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
-        handle_events(ui, s, &response, &m, pointer);
+        handle_events(ui, s, prefs, &response, &m, pointer);
     }
     let painter = ui.painter_at(m.rect);
     paint_grid(ui, s, theme, prefs, &painter, &m, &font, focused, search);
@@ -1118,6 +1183,7 @@ fn handle_scroll(
 fn handle_events(
     ui: &egui::Ui,
     s: &mut Session,
+    prefs: &Preferences,
     response: &egui::Response,
     m: &Metrics,
     p: PointerMode,
@@ -1147,7 +1213,9 @@ fn handle_events(
                 }
             }
             egui::Event::Cut => s.write(vec![24]),
-            egui::Event::Paste(text) => s.paste(&text),
+            egui::Event::Paste(text) => {
+                s.paste_or_hold(&text, prefs.confirm_multiline_paste);
+            }
             egui::Event::Key {
                 key,
                 pressed: true,
@@ -1444,6 +1512,36 @@ mod tests {
     use super::*;
     #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
+    #[test]
+    fn multiline_paste_needs_confirmation_only_without_bracketed_paste() {
+        // Single line, any mode: never asks.
+        assert!(!needs_confirm("ls -la", false, true));
+        assert!(!needs_confirm("ls -la", true, true));
+        // Line breaks of every flavour ask when bracketed paste is off.
+        for text in ["a\nb", "a\r\nb", "a\rb", "rm -rf ~\n"] {
+            assert!(needs_confirm(text, false, true), "{text:?}");
+            // Bracketed-paste programs receive it as text, so no prompt.
+            assert!(!needs_confirm(text, true, true), "{text:?}");
+            // "Don't ask again" turns the prompt off.
+            assert!(!needs_confirm(text, false, false), "{text:?}");
+        }
+        // Decided on the sanitised text: stripped controls are not line breaks.
+        assert!(!needs_confirm("a\x0bb\x0cc\u{85}d", false, true));
+        assert!(!needs_confirm("", false, true));
+    }
+    #[test]
+    fn paste_preview_counts_lines_and_escapes_controls() {
+        assert_eq!(paste_preview("one\ntwo\n"), (2, "one\ntwo".into()));
+        assert_eq!(paste_preview("a\r\nb\rc"), (3, "a\nb\nc".into()));
+        let (n, preview) = paste_preview("x\ty\u{202e}z\n2\n3\n4\n5\n6\n7");
+        assert_eq!(n, 7);
+        let lines: Vec<&str> = preview.lines().collect();
+        assert_eq!(lines.len(), 6, "{preview}");
+        assert_eq!(lines[0], "x\\ty\\u{202e}z");
+        assert_eq!(lines[5], "… 2 more line(s)");
+        let (_, long) = paste_preview(&"a".repeat(500));
+        assert_eq!(long.chars().count(), PREVIEW_LINE_CHARS + 1);
+    }
     #[test]
     fn hyperlink_targets_are_shown_safely() {
         assert!(openable_link("https://example.org"));
