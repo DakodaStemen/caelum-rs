@@ -305,9 +305,15 @@ impl App {
             })
             .unwrap_or_else(model::home)
     }
-    /// Re-read config.toml. A bad file keeps the previous settings and reports the error.
+    /// Read config.toml synchronously; used once at startup so the first frame
+    /// already has the user's settings. Hot reloads arrive from the watcher thread.
     fn reload_config(&mut self, ctx: &egui::Context, announce: bool) {
-        match Config::load(&self.config_path) {
+        let loaded = Config::load(&self.config_path);
+        self.apply_config(loaded, ctx, announce);
+    }
+    /// Apply a parsed config. A bad file keeps the previous settings and reports the error.
+    fn apply_config(&mut self, loaded: Result<Config>, ctx: &egui::Context, announce: bool) {
+        match loaded {
             Ok(config) => {
                 let keymap = Keymap::build(&config.keybindings).unwrap_or_default();
                 config.apply(&mut self.state.preferences);
@@ -967,14 +973,13 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
         }
-        if let Some(w) = &self.config_watch {
-            let mut changed = false;
-            while w.changes.try_recv().is_ok() {
-                changed = true;
-            }
-            if changed {
-                self.reload_config(ctx, true);
-            }
+        // The watcher thread reads and parses config.toml; only apply the newest result here.
+        if let Some(latest) = self
+            .config_watch
+            .as_ref()
+            .and_then(|w| w.changes.try_iter().last())
+        {
+            self.apply_config(latest, ctx, true);
         }
         self.shortcuts(ctx);
         self.apply_font(ctx);

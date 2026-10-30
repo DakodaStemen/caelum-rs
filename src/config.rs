@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -212,10 +213,16 @@ impl Keymap {
     }
 }
 
+/// How long the file must be quiet before it is re-read, so an editor's burst of
+/// write/rename events produces one reload of the final contents.
+pub const DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// Watches the config file's directory (so editors that replace the file are seen).
+/// A background thread debounces change events, then reads and parses the file off
+/// the UI thread and sends the result on `changes`.
 pub struct Watcher {
     _inner: notify::RecommendedWatcher,
-    pub changes: Receiver<()>,
+    pub changes: Receiver<Result<Config>>,
 }
 
 impl Watcher {
@@ -224,22 +231,49 @@ impl Watcher {
         let dir = path.parent().context("Config path has no directory")?;
         std::fs::create_dir_all(dir)?;
         let name = path.file_name().map(|n| n.to_os_string());
-        let (tx, changes) = mpsc::channel();
+        let (raw_tx, raw_rx) = mpsc::channel::<()>();
         let mut inner =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if let Ok(event) = event
                     && !event.kind.is_access()
                     && event.paths.iter().any(|p| p.file_name() == name.as_deref())
                 {
-                    let _ = tx.send(());
-                    wake.request_repaint();
+                    let _ = raw_tx.send(());
                 }
             })?;
         inner.watch(dir, RecursiveMode::NonRecursive)?;
+        let (tx, changes) = mpsc::channel();
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("config-reload".into())
+            .spawn(move || reload_loop(&path, &raw_rx, &tx, &wake))
+            .context("Cannot start config reload thread")?;
         Ok(Self {
             _inner: inner,
             changes,
         })
+    }
+}
+
+/// Runs until the watcher (event sender) or the app (result receiver) goes away.
+fn reload_loop(
+    path: &Path,
+    events: &Receiver<()>,
+    results: &mpsc::Sender<Result<Config>>,
+    wake: &eframe::egui::Context,
+) {
+    while events.recv().is_ok() {
+        loop {
+            match events.recv_timeout(DEBOUNCE) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        if results.send(Config::load(path)).is_err() {
+            return;
+        }
+        wake.request_repaint();
     }
 }
 
@@ -324,15 +358,40 @@ new_tab = "ctrl+alt+t"
         let path = d.path().join("config.toml");
         let w = Watcher::new(&path, eframe::egui::Context::default()).unwrap();
         std::fs::write(&path, "theme = \"a\"").unwrap();
-        w.changes
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("create event");
+        let c = w
+            .changes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("create");
+        assert_eq!(c.unwrap().theme.as_deref(), Some("a"));
         while w.changes.try_recv().is_ok() {}
         let tmp = d.path().join(".config.toml.tmp");
         std::fs::write(&tmp, "theme = \"b\"").unwrap();
         std::fs::rename(&tmp, &path).unwrap();
-        w.changes
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("replace event");
+        let c = w
+            .changes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replace");
+        assert_eq!(c.unwrap().theme.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn watcher_debounces_bursts_and_reports_parse_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        let w = Watcher::new(&path, eframe::egui::Context::default()).unwrap();
+        // Writes closer together than DEBOUNCE coalesce into one read of the final text.
+        for t in ["a", "b", "c", "d", "final"] {
+            std::fs::write(&path, format!("theme = \"{t}\"")).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let c = w
+            .changes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("burst");
+        assert_eq!(c.unwrap().theme.as_deref(), Some("final"));
+        while w.changes.recv_timeout(DEBOUNCE * 3).is_ok() {}
+        std::fs::write(&path, "[font]\nsize = 2").unwrap();
+        let c = w.changes.recv_timeout(Duration::from_secs(5)).expect("bad");
+        assert!(c.is_err());
     }
 }
