@@ -5,7 +5,11 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc,
+    },
 };
 const LIMIT: u64 = 5_000_000;
 #[derive(Clone)]
@@ -135,8 +139,17 @@ enum Job {
         text: String,
         expected: Vec<u8>,
         read_only: bool,
+        state: Arc<AtomicU8>,
     },
+    /// Test hook: parks the IO thread until the sender side signals or drops, so
+    /// later jobs stay queued.
+    #[cfg(test)]
+    Hold(mpsc::Receiver<()>),
 }
+/// [`Job::Save`] lifecycle, shared between the UI side and the IO thread.
+const SAVE_QUEUED: u8 = 0;
+const SAVE_STARTED: u8 = 1;
+const SAVE_CANCELLED: u8 = 2;
 enum Done {
     Opened {
         id: String,
@@ -165,14 +178,33 @@ fn run(job: Job) -> Done {
             text,
             expected,
             read_only,
+            state,
         } => {
-            let result = write_checked(&path, &text, &expected, read_only);
+            // Claim the job; a discard that won the race already marked it cancelled.
+            let result = match state.compare_exchange(
+                SAVE_QUEUED,
+                SAVE_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => write_checked(&path, &text, &expected, read_only),
+                Err(_) => Err(anyhow::anyhow!("Save cancelled; nothing was written")),
+            };
             Done::Saved {
                 id,
                 request,
                 path,
                 text,
                 result,
+            }
+        }
+        #[cfg(test)]
+        Job::Hold(rx) => {
+            let _ = rx.recv();
+            Done::Opened {
+                id: String::new(),
+                request: 0,
+                result: Err(anyhow::anyhow!("hold")),
             }
         }
     }
@@ -214,6 +246,7 @@ struct PendingOpen {
 struct InFlightSave {
     request: u64,
     queued: bool,
+    state: Arc<AtomicU8>,
 }
 /// Opens and saves editor documents on a background thread so file IO never
 /// stalls a frame. Results come back over a channel tagged with request ids;
@@ -316,11 +349,13 @@ impl DocumentIo {
     }
     fn start_save(&mut self, id: &str, doc: &Document) {
         let request = self.request();
+        let state = Arc::new(AtomicU8::new(SAVE_QUEUED));
         self.saves.insert(
             id.to_string(),
             InFlightSave {
                 request,
                 queued: false,
+                state: state.clone(),
             },
         );
         self.saves_submitted += 1;
@@ -331,7 +366,27 @@ impl DocumentIo {
             text: doc.text.clone(),
             expected: doc.hash.clone(),
             read_only: doc.read_only,
+            state,
         });
+    }
+    /// The user discarded `id`'s edits: cancel its save if the IO thread has not
+    /// started it yet, and drop any coalesced follow-up. A save the thread already
+    /// started is left to finish: it writes exactly the text the user earlier asked
+    /// to save, and aborting a write midway could leave a torn file. Either way the
+    /// document is forgotten here, so its result is ignored and [`Self::flush`] no
+    /// longer waits for it. Returns whether a not-yet-started save was cancelled.
+    pub fn discard(&mut self, id: &str) -> bool {
+        let Some(save) = self.saves.remove(id) else {
+            return false;
+        };
+        save.state
+            .compare_exchange(
+                SAVE_QUEUED,
+                SAVE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
     /// Drops open state for documents whose panes are gone. Saves already running
     /// still complete (and [`Self::flush`] still waits for them).
@@ -857,6 +912,48 @@ mod io_tests {
             Some("Binary file; use an external application")
         );
         assert!(docs.is_empty());
+    }
+    #[test]
+    fn discard_cancels_a_queued_save() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a");
+        fs::write(&p, "v0").unwrap();
+        let mut io = io();
+        let mut docs = HashMap::new();
+        opened(&mut io, &mut docs, "e", &p);
+        // Park the IO thread so the save below stays queued, as when "Save and
+        // close" lands behind other IO and the user then picks "Discard".
+        let (release, hold) = mpsc::channel();
+        io.submit(Job::Hold(hold));
+        docs.get_mut("e").unwrap().text = "v1".into();
+        assert_eq!(io.save("e", &docs["e"]), SaveRequest::Started);
+        docs.get_mut("e").unwrap().text = "v2".into();
+        assert_eq!(io.save("e", &docs["e"]), SaveRequest::Queued);
+        assert!(io.discard("e"), "a queued save must be cancellable");
+        docs.remove("e");
+        assert!(!io.saving("e"));
+        release.send(()).unwrap();
+        assert!(io.flush(&mut docs).is_empty());
+        drop(io); // joins the IO thread: every job has run (or been skipped)
+        assert_eq!(fs::read_to_string(&p).unwrap(), "v0");
+    }
+    #[test]
+    fn discard_lets_a_started_save_finish() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a");
+        fs::write(&p, "v0").unwrap();
+        let mut docs = HashMap::new();
+        let mut io = io();
+        opened(&mut io, &mut docs, "e", &p);
+        docs.get_mut("e").unwrap().text = "v1".into();
+        io.save("e", &docs["e"]);
+        let started = io.saves["e"].state.clone();
+        while started.load(Ordering::Acquire) == SAVE_QUEUED {
+            std::thread::yield_now();
+        }
+        assert!(!io.discard("e"), "a started save is not cancelled");
+        drop(io);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "v1");
     }
     #[test]
     fn dropping_the_worker_completes_queued_saves() {

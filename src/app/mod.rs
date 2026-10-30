@@ -806,6 +806,10 @@ impl App {
                 }
                 if discard {
                     for id in dirty {
+                        // A prior "Save and close" may still be queued on the IO thread;
+                        // cancel it so discarding never writes. A save already running
+                        // finishes (see `DocumentIo::discard`).
+                        self.docio.discard(&id);
                         self.documents.remove(&id);
                     }
                     self.finish_close(ctx);
