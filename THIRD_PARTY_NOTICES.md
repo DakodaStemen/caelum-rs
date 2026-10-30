@@ -14,5 +14,6 @@ Core components include:
 
 The Caelum mark is a hand-written SVG redraw (three nested crescent arcs) of the supplied icon, without lettering. Source SVGs
 are in `assets/brand`; `mark-app.svg` adds weight for small-size readability, and
-`icon.png` is its application rendering. Rust does not remove licensing obligations
-for bundled assets, fonts or third-party code.
+`icon.png` is its application rendering. No fonts are bundled; default fonts come from
+eframe and system fontconfig. Rust does not remove licensing obligations
+for bundled assets, dependencies or third-party code.

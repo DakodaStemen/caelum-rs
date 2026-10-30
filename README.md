@@ -13,7 +13,7 @@
   \____/_/   \_\_____|_____\___/|_|  |_|   · rs
 ```
 
-<p align="center"><strong>Your space to build.</strong><br>A native workspace terminal for Linux, built in Rust.</p>
+<p align="center"><strong>Your space to build.</strong><br>A native workspace terminal for Linux, macOS and Windows, built in Rust.</p>
 
 Caelum uses egui/eframe for the interface, Alacritty's terminal core
 (`alacritty_terminal`) for terminal semantics, and `portable-pty` for real shell
@@ -86,7 +86,7 @@ terminal for copy/paste. Ctrl-click an OSC 8 HTTP(S) hyperlink to open it.
 
 ## Why Caelum
 
-Caelum is young and Linux-only. This table states what each tool is built around so
+Caelum is young. This table states what each tool is built around so
 you can pick the right one; it is not a ranking.
 
 | | Caelum | tmux | Zellij | WezTerm | Ghostty |
@@ -97,20 +97,20 @@ you can pick the right one; it is not a ranking.
 | Built-in file browser, text editor, system monitor panes | Yes | No | Not built in (plugins exist) | No | No |
 | Image protocols (Sixel, Kitty, iTerm2) | No (design notes: [docs/image-protocols.md](docs/image-protocols.md)) | Depends on the host terminal and build | See project docs | Yes | Kitty graphics |
 | Scripting / plugins | None | Shell scripting, plugins via TPM | WebAssembly plugins | Lua | None |
-| Platforms | Linux (X11, Wayland) | Unix-like | Unix-like | Linux, macOS, Windows | Linux, macOS |
+| Platforms | Linux (X11, Wayland), macOS, Windows | Unix-like | Unix-like | Linux, macOS, Windows | Linux, macOS |
 | Maturity | Early (0.x) | Long-established | Established | Established | Established |
 
-Where Caelum is a reasonable fit: one native Linux window with terminal panes and a
+Where Caelum is a reasonable fit: one native window with terminal panes and a
 few built-in tools, and no scripting runtime. Where it is not: persistent remote
-sessions, image protocols, other operating systems or a plugin ecosystem. In those
+sessions, image protocols or a plugin ecosystem. In those
 cases tmux, Zellij, WezTerm or Ghostty are the better choice today. The comparison
 reflects each project's public documentation; check their pages for current details.
 
 ## Build and run
 
-Linux is the current target. Install a stable Rust toolchain, a C linker and the
-usual X11/Wayland and OpenGL runtime libraries. Fontconfig is used to locate a
-system monospace font; bundled font fallbacks remain available.
+Caelum targets Linux, macOS (universal DMG) and Windows (MSI + zip). Install a stable
+Rust toolchain, a C linker and the usual OS runtime libraries. On Linux, fontconfig is
+used to locate a system monospace font alongside eframe default fonts.
 
 On Ubuntu, the runtime packages include `libxkbcommon-x11-0`, `libx11-6`,
 `libwayland-client0`, `libegl1`, `libgl1` and `fontconfig`. On Arch, install

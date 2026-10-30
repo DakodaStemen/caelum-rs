@@ -13,8 +13,9 @@ graphics stack, fonts, shells and external commands as dependencies.
   conflict detection, atomic replacement and recovery documents. File edits resolve
   symlinks and retain permissions. Hard-linked files are not atomically replaced.
 - `theme.rs`: the shared palette model, color validation and native visual styling.
-- `app.rs`: native workspace/pane presentation, commands, tools, confirmation flows
-  and application integration checks.
+- `src/app/` (`mod.rs`, `editor.rs`, `panes.rs`, `persist.rs`, `settings.rs`, `sidebar.rs`, `terminal_pane.rs`): native workspace/pane presentation, commands, tools, confirmation flows, dialogs, settings, and application integration checks.
+- `platform.rs`: home/profile dirs, shell resolution, instance lock, system snapshot, process-tree kill across Linux, macOS and Windows.
+- `syntax.rs`: syntect highlighting with language detection and theme palette mapping.
 - `main.rs`: CLI, exclusive profile lock and native window startup.
 
 PTY reader threads update a synchronized Alacritty grid and request repaints.
@@ -34,5 +35,5 @@ Unknown workspace schemas stop startup and preserve the source file.
 
 The save conflict check catches changes since a file was loaded; it is not a
 filesystem-wide transaction against other applications writing simultaneously.
-The app currently targets Linux. X11 and Wayland window backends are included;
-platform behavior requires explicit runtime validation.
+The app targets Linux, macOS and Windows. On Linux, X11 and Wayland window
+backends are included; platform behavior requires explicit runtime validation.
