@@ -188,6 +188,10 @@ pub struct Session {
     /// Multi-line paste held for user confirmation (already sanitised).
     pending_paste: Option<String>,
     wake: egui::Context,
+    /// Test hook: when set, the cleanup thread waits for a message before doing any
+    /// work, so a test can prove `drop` returns while cleanup has not yet run.
+    #[cfg(test)]
+    cleanup_gate: Option<std::sync::mpsc::Receiver<()>>,
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
@@ -290,6 +294,8 @@ impl Session {
             pending_input: Vec::new(),
             pending_paste: None,
             wake: ctx,
+            #[cfg(test)]
+            cleanup_gate: None,
         })
     }
     pub fn write(&mut self, bytes: Vec<u8>) {
@@ -698,6 +704,8 @@ impl Drop for Session {
             return;
         };
         let threads = std::mem::take(&mut self.threads);
+        #[cfg(test)]
+        let gate = self.cleanup_gate.take();
         // Decide liveness before any signal so the cleanup thread never reaps the
         // child before it has walked the child's session.
         let running = matches!(child.try_wait(), Ok(None));
@@ -722,6 +730,10 @@ impl Drop for Session {
             }
         }
         let cleanup = move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
             if running && let Some(pid) = child.process_id() {
                 crate::platform::kill_process_tree(pid, &*master);
             }
@@ -1719,24 +1731,34 @@ mod regressions {
     #[test]
     fn dropping_a_session_does_not_block_the_caller() {
         // Previously kill, reap, the /proc sweep and both thread joins ran here, on
-        // the caller's (UI) thread.
+        // the caller's (UI) thread. Rather than a tight wall-clock bound (a 50ms limit
+        // flaked under CPU load), hold the cleanup thread on a gate and require that
+        // `drop` returns while the child is still unreaped: if any blocking cleanup
+        // (reap or thread join) moved back into `drop`, this deadlocks and the
+        // recv_timeout below fails deterministically, independent of machine load.
         let argv = [
             "/bin/sh".into(),
             "-c".into(),
             "trap '' HUP TERM; while :; do sleep 1; done".into(),
         ];
-        let s =
+        let mut s =
             Session::spawn(&crate::model::home(), Some(&argv), egui::Context::default()).unwrap();
         let pid = s.pid().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        s.cleanup_gate = Some(gate);
         thread::sleep(Duration::from_millis(100));
-        let start = Instant::now();
-        drop(s);
-        let took = start.elapsed();
-        assert!(
-            took < Duration::from_millis(50),
-            "drop blocked for {took:?}"
-        );
-        // The process is still reaped in the background.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(s);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // SAFETY: signal 0 only checks for existence; an unreaped zombie still exists.
+        let unreaped = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        let _ = release.send(());
+        assert!(returned, "drop blocked on the cleanup thread");
+        assert!(unreaped, "drop reaped {pid} before returning");
+        // The process is still reaped in the background once cleanup runs.
         let end = Instant::now() + Duration::from_secs(5);
         // SAFETY: signal 0 only checks for existence.
         while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < end {
