@@ -37,7 +37,12 @@ impl App {
                 }
             }
         }
-        let session = self.terminals.get_mut(id).unwrap();
+        let Some(session) = self.terminals.get_mut(id) else {
+            // Unreachable today (inserted above); the next frame respawns the session.
+            ui.colored_label(theme.ui("muted"), "Starting terminal…");
+            ctx.request_repaint();
+            return false;
+        };
         let allow_input = selected
             && !self.palette
             && !self.settings

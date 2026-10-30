@@ -434,32 +434,15 @@ impl State {
     pub fn save(&self, path: &Path) -> Result<()> {
         self.write_to(path, false)
     }
+    /// Serialises the workspace; cheap enough for the UI thread. Pair with
+    /// [`write_private`] (or a [`BackgroundWriter`]) to put the bytes on disk.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(self)?)
+    }
     /// Writes atomically; with `no_clobber` the final link fails if `path` exists,
     /// closing the exists()-then-write race.
     fn write_to(&self, path: &Path, no_clobber: bool) -> Result<()> {
-        let parent = path.parent().context("Workspace path has no parent")?;
-        create_private_dir(parent, false)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            temp.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-        temp.write_all(&serde_json::to_vec_pretty(self)?)?;
-        temp.as_file().sync_all()?;
-        if no_clobber {
-            temp.persist_noclobber(path).map_err(|e| {
-                if e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    anyhow::anyhow!("A Rust workspace already exists; it will not be overwritten")
-                } else {
-                    anyhow::Error::from(e.error)
-                }
-            })?;
-        } else {
-            temp.persist(path)?;
-        }
-        Ok(())
+        write_private_inner(path, &self.to_bytes()?, no_clobber)
     }
     /// Imports a copy. Unsupported legacy pane kinds are rejected rather than silently discarded.
     pub fn import_legacy(source: &Path, destination: &Path) -> Result<()> {
@@ -505,9 +488,211 @@ impl State {
         state.write_to(destination, true)
     }
 }
+
+/// Atomically replaces `path` with `bytes`: the parent is created private (0700 on
+/// unix), the temp file is 0600, synced, then renamed over `path`.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_inner(path, bytes, false)
+}
+fn write_private_inner(path: &Path, bytes: &[u8], no_clobber: bool) -> Result<()> {
+    let parent = path.parent().context("Path has no parent directory")?;
+    create_private_dir(parent, false)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    if no_clobber {
+        temp.persist_noclobber(path).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("A Rust workspace already exists; it will not be overwritten")
+            } else {
+                anyhow::Error::from(e.error)
+            }
+        })?;
+    } else {
+        temp.persist(path)?;
+    }
+    Ok(())
+}
+
+/// One batch of files written in order; the batch stops at the first failure.
+pub type WriteBatch = Vec<(PathBuf, Vec<u8>)>;
+
+#[derive(Default)]
+struct WriterInner {
+    pending: Option<WriteBatch>,
+    submitted: u64,
+    done: u64,
+    errors: Vec<String>,
+    shutdown: bool,
+}
+#[derive(Default)]
+struct WriterShared {
+    inner: std::sync::Mutex<WriterInner>,
+    changed: std::sync::Condvar,
+}
+impl WriterShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WriterInner> {
+        // A panic while holding the lock cannot leave WriterInner inconsistent.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+fn write_batch(batch: &WriteBatch) -> Option<String> {
+    for (path, bytes) in batch {
+        if let Err(e) = write_private(path, bytes) {
+            return Some(format!("{} was not saved: {e}", path.display()));
+        }
+    }
+    None
+}
+
+/// A single background thread that writes [`WriteBatch`]es with [`write_private`].
+/// Latest wins: a batch submitted while another is still queued replaces it, and
+/// batches are written one at a time in submission order, so an older snapshot can
+/// never land after a newer one. Dropping the writer drains the queue.
+pub struct BackgroundWriter {
+    shared: std::sync::Arc<WriterShared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Default for BackgroundWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl BackgroundWriter {
+    pub fn new() -> Self {
+        let shared = std::sync::Arc::new(WriterShared::default());
+        let worker = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("caelum-persist".into())
+            .spawn(move || {
+                loop {
+                    let mut inner = worker.lock();
+                    while inner.pending.is_none() && !inner.shutdown {
+                        inner = worker
+                            .changed
+                            .wait(inner)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    let Some(batch) = inner.pending.take() else {
+                        return; // shutdown with nothing queued
+                    };
+                    let generation = inner.submitted;
+                    drop(inner);
+                    let error = write_batch(&batch);
+                    let mut inner = worker.lock();
+                    inner.done = generation;
+                    inner.errors.extend(error);
+                    drop(inner);
+                    worker.changed.notify_all();
+                }
+            })
+            .ok();
+        Self { shared, thread }
+    }
+    /// Queues `batch`, replacing any batch not yet started.
+    pub fn submit(&self, batch: WriteBatch) {
+        if self.thread.is_none() {
+            // No worker thread could be started: write synchronously instead.
+            let error = write_batch(&batch);
+            let mut inner = self.shared.lock();
+            inner.submitted += 1;
+            inner.done = inner.submitted;
+            inner.errors.extend(error);
+            return;
+        }
+        let mut inner = self.shared.lock();
+        inner.submitted += 1;
+        inner.pending = Some(batch);
+        drop(inner);
+        self.shared.changed.notify_all();
+    }
+    /// Blocks until every batch submitted so far is on disk (or failed).
+    pub fn flush(&self) {
+        let mut inner = self.shared.lock();
+        let target = inner.submitted;
+        while inner.done < target && self.thread.is_some() {
+            inner = self
+                .shared
+                .changed
+                .wait(inner)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    /// Errors from finished batches since the last call.
+    pub fn take_errors(&self) -> Vec<String> {
+        std::mem::take(&mut self.shared.lock().errors)
+    }
+}
+impl Drop for BackgroundWriter {
+    fn drop(&mut self) {
+        self.shared.lock().shutdown = true;
+        self.shared.changed.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_writer_flushes_latest_batch() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("profile/workspace.json");
+        let writer = BackgroundWriter::new();
+        for i in 0..50 {
+            writer.submit(vec![(file.clone(), format!("{i}").into_bytes())]);
+        }
+        writer.flush();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "49");
+        assert!(writer.take_errors().is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Drop drains a batch that was never flushed.
+        writer.submit(vec![(file.clone(), b"last".to_vec())]);
+        drop(writer);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "last");
+    }
+    #[test]
+    fn background_writer_reports_errors_and_stops_batch() {
+        let d = tempfile::tempdir().unwrap();
+        let blocker = d.path().join("file");
+        fs::write(&blocker, "x").unwrap();
+        let after = d.path().join("after");
+        let writer = BackgroundWriter::new();
+        writer.submit(vec![
+            (blocker.join("child"), b"a".to_vec()),
+            (after.clone(), b"b".to_vec()),
+        ]);
+        writer.flush();
+        let errors = writer.take_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(!after.exists());
+        assert!(writer.take_errors().is_empty());
+    }
+    #[test]
+    fn state_bytes_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("workspace.json");
+        let state = State::default();
+        write_private(&file, &state.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            State::read(&file).unwrap().workspaces.len(),
+            state.workspaces.len()
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn private_dir_and_workspace_file_modes() {

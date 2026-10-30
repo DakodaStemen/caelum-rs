@@ -49,42 +49,137 @@ enum PendingClose {
     Pane,
     Workspace,
 }
+/// Result of a background directory listing: (path, filter, entries or error).
+type Listing = (
+    PathBuf,
+    String,
+    std::result::Result<Vec<files::Entry>, String>,
+);
 #[derive(Default)]
 struct FileView {
     path_input: String,
+    /// The path `path_input` was last synced from.
+    input_for: Option<PathBuf>,
     filter: String,
     entries: Vec<files::Entry>,
-    loaded: Option<PathBuf>,
+    /// Path and filter of the listing currently shown.
+    loaded: Option<(PathBuf, String)>,
     refreshed: Option<Instant>,
     error: String,
+    /// At most one listing in flight per view.
+    listing: Option<std::sync::mpsc::Receiver<Listing>>,
+}
+impl FileView {
+    /// Applies a finished listing, then starts a new one if the shown listing is for
+    /// another path/filter or older than two seconds. Never blocks on the disk.
+    fn poll(&mut self, path: &Path, ctx: &egui::Context) {
+        if let Some(rx) = &self.listing {
+            match rx.try_recv() {
+                Ok((dir, filter, result)) => {
+                    match result {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.error.clear();
+                        }
+                        Err(e) => self.error = e,
+                    }
+                    self.loaded = Some((dir, filter));
+                    self.refreshed = Some(Instant::now());
+                    self.listing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = "Directory listing stopped unexpectedly".into();
+                    self.refreshed = Some(Instant::now());
+                    self.listing = None;
+                }
+            }
+        }
+        let current = self
+            .loaded
+            .as_ref()
+            .is_some_and(|(p, f)| p == path && *f == self.filter);
+        let stale = self
+            .refreshed
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        if current && !stale {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = path.to_path_buf();
+        let filter = self.filter.clone();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("caelum-files".into())
+            .spawn(move || {
+                let result = files::list(&dir, &filter).map_err(|e| e.to_string());
+                let _ = tx.send((dir, filter, result));
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.listing = Some(rx),
+            Err(e) => {
+                self.error = format!("Cannot list directory: {e}");
+                self.refreshed = Some(Instant::now());
+            }
+        }
+    }
 }
 struct SystemInfo {
-    updated: Instant,
+    updated: Option<Instant>,
     load: String,
     memory: String,
     uptime: String,
     processes: Vec<(String, String, String)>,
+    /// The snapshot being taken on a background thread, if any.
+    snapshot: Option<std::sync::mpsc::Receiver<caelum_rs::platform::SystemSnapshot>>,
 }
 impl SystemInfo {
     fn new() -> Self {
         Self {
-            updated: Instant::now() - Duration::from_secs(10),
+            updated: None,
             load: String::new(),
             memory: String::new(),
             uptime: String::new(),
             processes: vec![],
+            snapshot: None,
         }
     }
-    fn refresh(&mut self) {
-        if self.updated.elapsed() < Duration::from_secs(2) {
+    /// Takes in a finished snapshot and starts the next one (at most one in flight,
+    /// at most every two seconds). Reading /proc never runs on the UI thread.
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.snapshot {
+            match rx.try_recv() {
+                Ok(snap) => {
+                    self.load = snap.load;
+                    self.memory = snap.memory;
+                    self.uptime = snap.uptime;
+                    self.processes = snap.processes;
+                    self.snapshot = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.snapshot = None,
+            }
+        }
+        if self
+            .updated
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+        {
             return;
         }
-        self.updated = Instant::now();
-        let snap = caelum_rs::platform::system_snapshot();
-        self.load = snap.load;
-        self.memory = snap.memory;
-        self.uptime = snap.uptime;
-        self.processes = snap.processes;
+        self.updated = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        if std::thread::Builder::new()
+            .name("caelum-system".into())
+            .spawn(move || {
+                let _ = tx.send(caelum_rs::platform::system_snapshot());
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.snapshot = Some(rx);
+        }
     }
 }
 pub struct App {
@@ -118,6 +213,7 @@ pub struct App {
     last_dialog: Option<String>,
     pending_save: Option<String>,
     syntax: Highlighter,
+    writer: model::BackgroundWriter,
 }
 struct Smoke {
     report: PathBuf,
@@ -138,9 +234,10 @@ impl App {
         message: String,
         smoke: Option<PathBuf>,
     ) -> Self {
+        // The logo is compiled in; a decode failure falls back to a blank texture.
         let image = image::load_from_memory(include_bytes!("../../assets/brand/logo.png"))
-            .unwrap()
-            .to_rgba8();
+            .map(|i| i.to_rgba8())
+            .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
         let size = [image.width() as usize, image.height() as usize];
         let logo = cc.egui_ctx.load_texture(
             "Caelum",
@@ -223,6 +320,7 @@ impl App {
             last_dialog: None,
             pending_save: None,
             syntax: Highlighter::default(),
+            writer: model::BackgroundWriter::new(),
         };
         app.restore_drafts();
         app.ensure_focus();
@@ -697,13 +795,12 @@ impl App {
         match pending {
             PendingClose::Window => {
                 self.allow_close = true;
-                self.persist();
+                self.persist_now();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             PendingClose::Workspace => {
-                let i = self.state.active_index();
-                self.state.workspaces.remove(i);
-                self.state.active_workspace = self.state.workspaces[0].id.clone();
+                let cwd = self.cwd();
+                close_workspace(&mut self.state, cwd);
             }
             PendingClose::Tab => {
                 let cwd = self.cwd();
@@ -769,7 +866,7 @@ impl App {
                     if !self
                         .terminals
                         .get(&s.terminal)
-                        .unwrap()
+                        .context("Smoke terminal disappeared")?
                         .text()
                         .contains("NATIVE_RUST_OK")
                     {
@@ -802,7 +899,7 @@ impl App {
                     }
                     s.checks.push("New tab owns an independent terminal".into());
                     self.action(Action::Theme("graphite".into()), ctx);
-                    self.persist();
+                    self.persist_now();
                     let restored = State::read(&self.profile.join("workspace.json"))?;
                     if restored.preferences.theme != "graphite" {
                         bail!("Theme was not persisted");
@@ -838,17 +935,20 @@ impl App {
                     self.action(Action::System, ctx);
                 }
                 7 => {
-                    self.system.refresh();
+                    // The snapshot arrives from a background thread; the overall
+                    // timeout reports a view that never fills.
+                    self.system.refresh(ctx);
                     if self.system.memory.is_empty() {
-                        bail!("System view missing");
+                        return Ok(false);
                     }
                     s.checks
                         .push("System view reads live memory and uptime".into());
                     self.action(Action::Processes, ctx);
                 }
                 8 => {
+                    self.system.refresh(ctx);
                     if self.system.processes.is_empty() {
-                        bail!("No processes shown");
+                        return Ok(false);
                     }
                     s.checks.push("Process viewer lists live processes".into());
                     self.action(Action::Theme("lunar".into()), ctx);
@@ -886,7 +986,7 @@ impl App {
                     }
                     let report = serde_json::json!({"passed":s.checks,"profile":self.profile,"renderer":"native egui/OpenGL","success":true});
                     fs::write(&s.report, serde_json::to_vec_pretty(&report)?)?;
-                    self.persist();
+                    self.persist_now();
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return Ok(true);
@@ -966,6 +1066,7 @@ impl eframe::App for App {
         if self.last_save.elapsed() > Duration::from_secs(3) {
             self.persist();
         }
+        self.report_write_errors();
         self.smoke_tick(ctx);
         ctx.request_repaint_after(Duration::from_millis(
             if self.state.preferences.cursor_blink {
@@ -976,9 +1077,22 @@ impl eframe::App for App {
         ));
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist();
+        self.persist_now();
         self.terminals.clear();
     }
+}
+/// Removes the active workspace. The state never ends up without a workspace: closing
+/// the last one leaves a fresh workspace at `cwd` in its place.
+fn close_workspace(state: &mut State, cwd: PathBuf) {
+    let i = state.active_index();
+    if i < state.workspaces.len() {
+        state.workspaces.remove(i);
+    }
+    if state.workspaces.is_empty() {
+        state.workspaces.push(Workspace::new("Workspace 1", cwd));
+    }
+    let next = i.min(state.workspaces.len() - 1);
+    state.active_workspace = state.workspaces[next].id.clone();
 }
 fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
     if root.id() == id {
@@ -989,5 +1103,39 @@ fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
         } else {
             update_node(second, id, replacement);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn closing_last_workspace_leaves_a_fresh_one() {
+        let mut state = State::default();
+        let cwd = std::env::temp_dir();
+        while state.workspaces.len() > 1 {
+            close_workspace(&mut state, cwd.clone());
+        }
+        let only = state.workspaces[0].id.clone();
+        close_workspace(&mut state, cwd.clone());
+        assert_eq!(state.workspaces.len(), 1);
+        assert_ne!(state.workspaces[0].id, only);
+        assert_eq!(state.active_workspace, state.workspaces[0].id);
+    }
+    #[test]
+    fn closing_a_workspace_activates_a_neighbour() {
+        let mut state = State::default();
+        let cwd = std::env::temp_dir();
+        for n in 0..3 {
+            state
+                .workspaces
+                .push(Workspace::new(format!("W{n}"), cwd.clone()));
+        }
+        let last = state.workspaces.last().unwrap().id.clone();
+        state.active_workspace = last.clone();
+        let before = state.workspaces.len();
+        close_workspace(&mut state, cwd);
+        assert_eq!(state.workspaces.len(), before - 1);
+        assert!(state.workspaces.iter().all(|w| w.id != last));
+        assert_eq!(state.active_workspace, state.workspaces.last().unwrap().id);
     }
 }

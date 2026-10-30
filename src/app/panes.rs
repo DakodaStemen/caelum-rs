@@ -213,23 +213,12 @@ impl App {
         path: &mut PathBuf,
     ) {
         let view = self.files.entry(id.to_string()).or_default();
-        let stale = view
-            .refreshed
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(2));
-        if view.loaded.as_ref() != Some(&*path) || stale {
-            if view.loaded.as_ref() != Some(&*path) {
-                view.path_input = path.display().to_string();
-            }
-            match files::list(path, &view.filter) {
-                Ok(entries) => {
-                    view.entries = entries;
-                    view.error.clear();
-                }
-                Err(e) => view.error = e.to_string(),
-            }
-            view.loaded = Some(path.clone());
-            view.refreshed = Some(Instant::now());
+        if view.input_for.as_ref() != Some(&*path) {
+            view.path_input = path.display().to_string();
+            view.input_for = Some(path.clone());
         }
+        // Shows the last listing until the background one for this path arrives.
+        view.poll(path, ui.ctx());
         ui.horizontal(|ui| {
             if ui.small_button("Up").clicked()
                 && let Some(parent) = path.parent()
@@ -249,12 +238,7 @@ impl App {
                 };
             }
         });
-        if ui
-            .add(egui::TextEdit::singleline(&mut view.filter).hint_text("Filter files…"))
-            .changed()
-        {
-            view.refreshed = None;
-        }
+        ui.add(egui::TextEdit::singleline(&mut view.filter).hint_text("Filter files…"));
         if !view.error.is_empty() {
             ui.colored_label(theme.ui("danger"), &view.error);
         }
@@ -285,7 +269,7 @@ impl App {
         }
     }
     pub(super) fn system_pane(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        self.system.refresh();
+        self.system.refresh(ui.ctx());
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(16.);
             for (name, value) in [
@@ -305,7 +289,7 @@ impl App {
         });
     }
     pub(super) fn processes_pane(&mut self, ui: &mut egui::Ui, id: &str) {
-        self.system.refresh();
+        self.system.refresh(ui.ctx());
         ui.add(
             egui::TextEdit::singleline(&mut self.process_filter).hint_text("Filter name or PID…"),
         );
