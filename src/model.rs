@@ -54,6 +54,65 @@ pub fn allowed_terminal_command(command: Option<&[String]>) -> bool {
         Some(_) => false,
     }
 }
+/// Refuses a profile another user could have tampered with: on unix the profile
+/// directory and any existing `workspace.json` / `drafts.json` must be owned by the
+/// current user and not group/world-writable (and not symlinks). The directory is
+/// tightened to 0700 first when we own it. No-op elsewhere.
+pub fn check_profile_trust(profile: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let check = |path: &Path, meta: &fs::Metadata| -> Result<()> {
+            if meta.uid() != uid {
+                bail!(
+                    "Refusing to load {}: it is owned by uid {}, not the current user (uid {uid})",
+                    path.display(),
+                    meta.uid()
+                );
+            }
+            if meta.mode() & 0o022 != 0 {
+                bail!(
+                    "Refusing to load {}: it is group- or world-writable (mode {:o}); run chmod go-w on it",
+                    path.display(),
+                    meta.mode() & 0o777
+                );
+            }
+            Ok(())
+        };
+        let dir = fs::symlink_metadata(profile)
+            .with_context(|| format!("Reading {}", profile.display()))?;
+        if dir.file_type().is_symlink() {
+            // Follow the link but judge the real directory.
+            let real = fs::metadata(profile)?;
+            check(profile, &real)?;
+        } else {
+            if dir.uid() == uid && dir.mode() & 0o077 != 0 {
+                fs::set_permissions(profile, fs::Permissions::from_mode(0o700))?;
+            }
+            check(profile, &fs::metadata(profile)?)?;
+        }
+        for name in ["workspace.json", "drafts.json"] {
+            let path = profile.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        bail!("Refusing to load {}: it is a symlink", path.display());
+                    }
+                    check(&path, &meta)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+    }
+    Ok(())
+}
 pub fn profile() -> PathBuf {
     std::env::var_os("CAELUM_RS_DATA")
         .map(PathBuf::from)
@@ -373,6 +432,11 @@ impl State {
         Ok(s)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.write_to(path, false)
+    }
+    /// Writes atomically; with `no_clobber` the final link fails if `path` exists,
+    /// closing the exists()-then-write race.
+    fn write_to(&self, path: &Path, no_clobber: bool) -> Result<()> {
         let parent = path.parent().context("Workspace path has no parent")?;
         create_private_dir(parent, false)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -384,7 +448,17 @@ impl State {
         }
         temp.write_all(&serde_json::to_vec_pretty(self)?)?;
         temp.as_file().sync_all()?;
-        temp.persist(path)?;
+        if no_clobber {
+            temp.persist_noclobber(path).map_err(|e| {
+                if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow::anyhow!("A Rust workspace already exists; it will not be overwritten")
+                } else {
+                    anyhow::Error::from(e.error)
+                }
+            })?;
+        } else {
+            temp.persist(path)?;
+        }
         Ok(())
     }
     /// Imports a copy. Unsupported legacy pane kinds are rejected rather than silently discarded.
@@ -428,7 +502,7 @@ impl State {
         if !state.warnings.is_empty() {
             bail!("Legacy workspace contains an unsupported terminal command");
         }
-        state.save(destination)
+        state.write_to(destination, true)
     }
 }
 #[cfg(test)]
@@ -482,6 +556,47 @@ mod tests {
         assert!(State::import_legacy(&old, &new).is_err());
         assert_eq!(bytes, fs::read(&old).unwrap());
         assert_eq!(State::read(&new).unwrap().workspaces.len(), 1);
+    }
+    #[test]
+    fn import_never_clobbers_a_destination_created_after_the_check() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("dest.json");
+        fs::write(&dest, "racer").unwrap();
+        // Bypass the early exists() check to exercise the atomic no-clobber link.
+        assert!(State::default().write_to(&dest, true).is_err());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "racer");
+        let fresh = d.path().join("fresh.json");
+        State::default().write_to(&fresh, true).unwrap();
+        assert!(State::read(&fresh).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn profile_trust_rejects_writable_files_and_tightens_dir() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("p");
+        fs::create_dir(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o775)).unwrap();
+        check_profile_trust(&profile).unwrap();
+        assert_eq!(
+            fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let ws = profile.join("workspace.json");
+        State::default().save(&ws).unwrap();
+        check_profile_trust(&profile).unwrap();
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o600)).unwrap();
+        let drafts = profile.join("drafts.json");
+        fs::write(&drafts, "[]").unwrap();
+        fs::set_permissions(&drafts, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::remove_file(&drafts).unwrap();
+        symlink(&ws, &drafts).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::remove_file(&drafts).unwrap();
+        check_profile_trust(&profile).unwrap();
     }
     #[test]
     fn duplicate_panes_are_rejected() {

@@ -45,6 +45,8 @@ fn main() -> Result<()> {
         None
     };
     caelum_rs::model::create_private_dir(&profile, true)?;
+    // Never load workspace/drafts another user could have written: they can launch commands.
+    caelum_rs::model::check_profile_trust(&profile)?;
     // A process-held lock prevents two windows from racing workspace writes.
     let _lock =
         caelum_rs::platform::lock_instance(&profile.join("app.lock"))?.with_context(|| {
