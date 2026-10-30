@@ -25,7 +25,14 @@ impl App {
             .syntax
             .language(path)
             .unwrap_or_else(|| "Plain text".into());
-        let doc = self.documents.get_mut(id).unwrap();
+        let Some(doc) = self.documents.get_mut(id) else {
+            // Unreachable today (inserted above); render a placeholder rather than panic.
+            ui.colored_label(
+                theme.ui("danger"),
+                "Document is not loaded; reopen the file",
+            );
+            return false;
+        };
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!doc.read_only && doc.dirty(), egui::Button::new("Save"))
