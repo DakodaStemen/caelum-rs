@@ -13,6 +13,14 @@ impl App {
         command: &Option<Vec<String>>,
     ) -> bool {
         if !self.terminals.contains_key(id) {
+            // Defense in depth: State::validate already drops unsupported commands.
+            if !model::allowed_terminal_command(command.as_deref()) {
+                ui.colored_label(
+                    theme.ui("danger"),
+                    "Refusing to launch an unsupported terminal command",
+                );
+                return false;
+            }
             let test_command = caelum_rs::platform::test_shell_command();
             let chosen = if self.smoke.is_some() {
                 Some(test_command.as_slice())

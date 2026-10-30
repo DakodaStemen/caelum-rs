@@ -71,6 +71,9 @@ fn main() -> Result<()> {
     } else {
         State::default()
     };
+    if let Some(first) = state.warnings.first() {
+        message = first.clone();
+    }
     if smoke.is_some() {
         message = "Desktop validation · isolated profile".into();
     }
