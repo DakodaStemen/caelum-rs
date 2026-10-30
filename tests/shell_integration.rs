@@ -121,3 +121,53 @@ fn fish_osc7_encodes_hostile_directory_names() {
         .to_string();
     assert_single_cwd(&out, host, &dir);
 }
+
+/// Bytes >= 0x80 must encode as exactly one `%XX` (bash 3.2 sign-extends them to
+/// `%FFFFFFFFFFFFFFC3` unless the value is masked to a byte).
+#[cfg(unix)]
+const HIGH_BYTES: &[u8] = b"a\x80\xc3\xa9\xff z";
+#[cfg(unix)]
+const HIGH_BYTES_ENCODED: &[u8] = b"a%80%C3%A9%FF%20z";
+
+#[cfg(unix)]
+fn high_bytes_arg() -> &'static std::ffi::OsStr {
+    std::os::unix::ffi::OsStrExt::from_bytes(HIGH_BYTES)
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_urlencode_masks_high_bytes() {
+    let Some(bash) = find("bash") else {
+        eprintln!("bash not found; skipping");
+        return;
+    };
+    let out = run(Command::new(bash)
+        .arg("--norc")
+        .arg("-c")
+        .arg(format!(
+            "source '{}'; __caelum_urlencode \"$1\"; printf '%s' \"$REPLY\"",
+            snippet("caelum.bash")
+        ))
+        .arg("_")
+        .arg(high_bytes_arg()));
+    assert_eq!(out, HIGH_BYTES_ENCODED, "{}", String::from_utf8_lossy(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn zsh_urlencode_masks_high_bytes() {
+    let Some(zsh) = find("zsh") else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let out = run(Command::new(zsh)
+        .arg("-f")
+        .arg("-c")
+        .arg(format!(
+            "source '{}' 2>/dev/null; __caelum_urlencode \"$1\"; print -rn -- \"$REPLY\"",
+            snippet("caelum.zsh")
+        ))
+        .arg("_")
+        .arg(high_bytes_arg()));
+    assert_eq!(out, HIGH_BYTES_ENCODED, "{}", String::from_utf8_lossy(&out));
+}

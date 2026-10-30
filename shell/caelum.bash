@@ -4,13 +4,14 @@
 # Percent-encode every byte outside [A-Za-z0-9/._~-] so control bytes (BEL, ESC),
 # '%', spaces and non-ASCII bytes in a directory name cannot end or inject sequences.
 __caelum_urlencode() {
-  local LC_ALL=C s=$1 c h i
+  local LC_ALL=C s=$1 c h i n
   REPLY=
   for (( i = 0; i < ${#s}; i++ )); do
     c=${s:i:1}
     case $c in
       [A-Za-z0-9/._~-]) REPLY+=$c ;;
-      *) printf -v h '%%%02X' "'$c"; REPLY+=$h ;;
+      # bash 3.2 (macOS) sign-extends bytes >= 0x80 in "'c", so mask to one byte.
+      *) printf -v n '%d' "'$c"; printf -v h '%%%02X' $(( n & 255 )); REPLY+=$h ;;
     esac
   done
 }
