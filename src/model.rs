@@ -33,6 +33,86 @@ pub fn create_private_dir(path: &Path, fix_existing: bool) -> Result<()> {
     }
     Ok(())
 }
+/// Accepts an SSH destination (`host`, `user@host`, `[v6]:port`) that cannot be
+/// mistaken for an option: non-empty, no leading `-`, and only `[A-Za-z0-9_.@:\-\[\]]`.
+/// Shared by the SSH dialog and workspace validation so both enforce the same rule.
+pub fn valid_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.@:-[]".contains(c))
+}
+/// Terminal panes may only launch the user's shell (`None`), `ssh -- <host>`,
+/// `codex` or `claude`. Anything else in a workspace file is untrusted and must
+/// never reach `Session::spawn`.
+pub fn allowed_terminal_command(command: Option<&[String]>) -> bool {
+    match command {
+        None => true,
+        Some([program]) => program == "codex" || program == "claude",
+        Some([ssh, dashes, host]) => ssh == "ssh" && dashes == "--" && valid_ssh_host(host),
+        Some(_) => false,
+    }
+}
+/// Refuses a profile another user could have tampered with: on unix the profile
+/// directory and any existing `workspace.json` / `drafts.json` must be owned by the
+/// current user and not group/world-writable (and not symlinks). The directory is
+/// tightened to 0700 first when we own it. No-op elsewhere.
+pub fn check_profile_trust(profile: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let check = |path: &Path, meta: &fs::Metadata| -> Result<()> {
+            if meta.uid() != uid {
+                bail!(
+                    "Refusing to load {}: it is owned by uid {}, not the current user (uid {uid})",
+                    path.display(),
+                    meta.uid()
+                );
+            }
+            if meta.mode() & 0o022 != 0 {
+                bail!(
+                    "Refusing to load {}: it is group- or world-writable (mode {:o}); run chmod go-w on it",
+                    path.display(),
+                    meta.mode() & 0o777
+                );
+            }
+            Ok(())
+        };
+        let dir = fs::symlink_metadata(profile)
+            .with_context(|| format!("Reading {}", profile.display()))?;
+        if dir.file_type().is_symlink() {
+            // Follow the link but judge the real directory.
+            let real = fs::metadata(profile)?;
+            check(profile, &real)?;
+        } else {
+            if dir.uid() == uid && dir.mode() & 0o077 != 0 {
+                fs::set_permissions(profile, fs::Permissions::from_mode(0o700))?;
+            }
+            check(profile, &fs::metadata(profile)?)?;
+        }
+        for name in ["workspace.json", "drafts.json"] {
+            let path = profile.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        bail!("Refusing to load {}: it is a symlink", path.display());
+                    }
+                    check(&path, &meta)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+    }
+    Ok(())
+}
 pub fn profile() -> PathBuf {
     std::env::var_os("CAELUM_RS_DATA")
         .map(PathBuf::from)
@@ -230,6 +310,9 @@ pub struct State {
     pub active_workspace: String,
     #[serde(default)]
     pub preferences: Preferences,
+    /// Non-fatal problems found while validating (e.g. a dropped terminal command).
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -248,6 +331,7 @@ impl Default for State {
             active_workspace: w.id.clone(),
             workspaces: vec![w],
             preferences: Preferences::default(),
+            warnings: vec![],
         }
     }
 }
@@ -266,12 +350,30 @@ impl State {
             bail!("Workspace file contains no workspaces");
         }
         let mut ids = HashSet::new();
-        fn node(p: &mut Pane, ids: &mut HashSet<String>, depth: usize) -> Result<()> {
+        let mut warnings = vec![];
+        fn node(
+            p: &mut Pane,
+            ids: &mut HashSet<String>,
+            warnings: &mut Vec<String>,
+            depth: usize,
+        ) -> Result<()> {
             if depth > 32 {
                 bail!("Workspace layout is too deeply nested");
             }
             if !ids.insert(p.id().to_string()) {
                 bail!("Duplicate workspace identifier");
+            }
+            if let Pane::Terminal { id, command, .. } = p
+                && !allowed_terminal_command(command.as_deref())
+            {
+                // Drop rather than reject so an existing profile still opens; the pane
+                // falls back to the user's shell and the command is never executed.
+                let warning = format!(
+                    "Terminal pane {id} had an unsupported launch command; it will open your shell instead"
+                );
+                eprintln!("caelum-rs: {warning}");
+                warnings.push(warning);
+                *command = None;
             }
             if let Pane::Split {
                 ratio,
@@ -285,8 +387,8 @@ impl State {
                 } else {
                     0.5
                 };
-                node(first, ids, depth + 1)?;
-                node(second, ids, depth + 1)?;
+                node(first, ids, warnings, depth + 1)?;
+                node(second, ids, warnings, depth + 1)?;
             }
             Ok(())
         }
@@ -301,7 +403,7 @@ impl State {
                 if !ids.insert(t.id.clone()) {
                     bail!("Duplicate tab identifier");
                 }
-                node(&mut t.layout, &mut ids, 0)?;
+                node(&mut t.layout, &mut ids, &mut warnings, 0)?;
             }
             if !w.tabs.iter().any(|t| t.id == w.active_tab) {
                 w.active_tab = w.tabs[0].id.clone();
@@ -319,6 +421,7 @@ impl State {
         for theme in &self.preferences.custom_themes {
             theme.validate()?;
         }
+        self.warnings.extend(warnings);
         Ok(())
     }
     pub fn read(path: &Path) -> Result<Self> {
@@ -329,6 +432,11 @@ impl State {
         Ok(s)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.write_to(path, false)
+    }
+    /// Writes atomically; with `no_clobber` the final link fails if `path` exists,
+    /// closing the exists()-then-write race.
+    fn write_to(&self, path: &Path, no_clobber: bool) -> Result<()> {
         let parent = path.parent().context("Workspace path has no parent")?;
         create_private_dir(parent, false)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -340,7 +448,17 @@ impl State {
         }
         temp.write_all(&serde_json::to_vec_pretty(self)?)?;
         temp.as_file().sync_all()?;
-        temp.persist(path)?;
+        if no_clobber {
+            temp.persist_noclobber(path).map_err(|e| {
+                if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow::anyhow!("A Rust workspace already exists; it will not be overwritten")
+                } else {
+                    anyhow::Error::from(e.error)
+                }
+            })?;
+        } else {
+            temp.persist(path)?;
+        }
         Ok(())
     }
     /// Imports a copy. Unsupported legacy pane kinds are rejected rather than silently discarded.
@@ -351,16 +469,12 @@ impl State {
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(source)?)?;
         fn convert(value: &mut serde_json::Value) -> Result<()> {
             if let Some(object) = value.as_object_mut() {
-                if object.get("kind").and_then(|v| v.as_str()) == Some("terminal")
-                    && !object.contains_key("command")
-                {
+                if object.get("kind").and_then(|v| v.as_str()) == Some("terminal") {
+                    // Never trust a launch command from the legacy file; derive it only
+                    // from the validated `ssh` / `assistant` fields.
+                    object.remove("command");
                     if let Some(host) = object.get("ssh").and_then(|v| v.as_str()) {
-                        if host.is_empty()
-                            || host.starts_with('-')
-                            || !host
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || "_.@:-[]".contains(c))
-                        {
+                        if !valid_ssh_host(host) {
                             bail!("Unsupported SSH host in legacy workspace");
                         }
                         object.insert("command".into(), serde_json::json!(["ssh", "--", host]));
@@ -385,7 +499,10 @@ impl State {
         convert(&mut value)?;
         let mut state: Self = serde_json::from_value(value)?;
         state.validate()?;
-        state.save(destination)
+        if !state.warnings.is_empty() {
+            bail!("Legacy workspace contains an unsupported terminal command");
+        }
+        state.write_to(destination, true)
     }
 }
 #[cfg(test)]
@@ -441,6 +558,47 @@ mod tests {
         assert_eq!(State::read(&new).unwrap().workspaces.len(), 1);
     }
     #[test]
+    fn import_never_clobbers_a_destination_created_after_the_check() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join("dest.json");
+        fs::write(&dest, "racer").unwrap();
+        // Bypass the early exists() check to exercise the atomic no-clobber link.
+        assert!(State::default().write_to(&dest, true).is_err());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "racer");
+        let fresh = d.path().join("fresh.json");
+        State::default().write_to(&fresh, true).unwrap();
+        assert!(State::read(&fresh).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn profile_trust_rejects_writable_files_and_tightens_dir() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("p");
+        fs::create_dir(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o775)).unwrap();
+        check_profile_trust(&profile).unwrap();
+        assert_eq!(
+            fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let ws = profile.join("workspace.json");
+        State::default().save(&ws).unwrap();
+        check_profile_trust(&profile).unwrap();
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o600)).unwrap();
+        let drafts = profile.join("drafts.json");
+        fs::write(&drafts, "[]").unwrap();
+        fs::set_permissions(&drafts, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::remove_file(&drafts).unwrap();
+        symlink(&ws, &drafts).unwrap();
+        assert!(check_profile_trust(&profile).is_err());
+        fs::remove_file(&drafts).unwrap();
+        check_profile_trust(&profile).unwrap();
+    }
+    #[test]
     fn duplicate_panes_are_rejected() {
         let mut s = State::default();
         let t = s.workspaces[0].tabs[0].clone();
@@ -469,5 +627,116 @@ mod migration_tests {
             matches!(&leaves[0],Pane::Terminal{command:Some(command),..} if command==&vec!["ssh","--","user@example.org"])
         );
         assert!(matches!(&leaves[1],Pane::Browser{url,..} if url=="https://example.org"));
+    }
+
+    fn legacy(terminal: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"version":1,"activeWorkspace":"w","workspaces":[{"id":"w","name":"L","activeTab":"t","tabs":[{"id":"t","name":"T","layout":terminal}]}]})
+    }
+    fn only_command(state: &State) -> Option<Vec<String>> {
+        match &state.workspaces[0].tabs[0].layout {
+            Pane::Terminal { command, .. } => command.clone(),
+            other => panic!("unexpected pane {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_import_strips_injected_command() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.json");
+        let destination = d.path().join("dest.json");
+        // A bare command with no ssh/assistant is discarded entirely.
+        let v = legacy(
+            serde_json::json!({"id":"x","kind":"terminal","cwd":"/tmp","command":["sh","-c","touch /tmp/pwned"]}),
+        );
+        fs::write(&source, serde_json::to_vec(&v).unwrap()).unwrap();
+        State::import_legacy(&source, &destination).unwrap();
+        assert_eq!(only_command(&State::read(&destination).unwrap()), None);
+        // A command next to a valid ssh host is replaced by the derived ssh argv.
+        fs::remove_file(&destination).unwrap();
+        let v = legacy(
+            serde_json::json!({"id":"x","kind":"terminal","cwd":"/tmp","ssh":"h","command":["ssh","-oProxyCommand=touch /tmp/x","h"]}),
+        );
+        fs::write(&source, serde_json::to_vec(&v).unwrap()).unwrap();
+        State::import_legacy(&source, &destination).unwrap();
+        assert_eq!(
+            only_command(&State::read(&destination).unwrap()),
+            Some(vec!["ssh".into(), "--".into(), "h".into()])
+        );
+    }
+
+    #[test]
+    fn legacy_import_rejects_ssh_option_injection() {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.json");
+        let destination = d.path().join("dest.json");
+        for host in ["-oProxyCommand=touch /tmp/x", "", "a b", "h;id"] {
+            let v = legacy(serde_json::json!({"id":"x","kind":"terminal","ssh":host}));
+            fs::write(&source, serde_json::to_vec(&v).unwrap()).unwrap();
+            assert!(
+                State::import_legacy(&source, &destination).is_err(),
+                "{host:?}"
+            );
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn workspace_file_with_arbitrary_command_drops_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("workspace.json");
+        for bad in [
+            serde_json::json!(["sh", "-c", "touch /tmp/pwned"]),
+            serde_json::json!(["ssh", "-oProxyCommand=touch /tmp/x", "h"]),
+            serde_json::json!(["ssh", "--", "-oProxyCommand=x"]),
+            serde_json::json!(["ssh", "--", "h", "extra"]),
+            serde_json::json!(["codex", "--dangerously-bypass"]),
+            serde_json::json!(["/usr/bin/claude"]),
+            serde_json::json!([]),
+        ] {
+            let v = legacy(serde_json::json!({"id":"x","kind":"terminal","command":bad}));
+            fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+            let state = State::read(&path).unwrap();
+            assert_eq!(only_command(&state), None, "{bad}");
+            assert_eq!(state.warnings.len(), 1);
+        }
+    }
+
+    #[test]
+    fn valid_ssh_codex_claude_commands_are_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("workspace.json");
+        for good in [
+            vec!["ssh", "--", "user@example.org"],
+            vec!["ssh", "--", "[::1]:22"],
+            vec!["codex"],
+            vec!["claude"],
+        ] {
+            let v = legacy(serde_json::json!({"id":"x","kind":"terminal","command":good}));
+            fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+            let state = State::read(&path).unwrap();
+            let want: Vec<String> = good.iter().map(|s| s.to_string()).collect();
+            assert_eq!(only_command(&state), Some(want));
+            assert!(state.warnings.is_empty());
+        }
+        // Legacy assistant/ssh fields are converted to the same allowed argv.
+        let source = d.path().join("legacy.json");
+        let destination = d.path().join("dest.json");
+        let v = legacy(serde_json::json!({"id":"x","kind":"terminal","assistant":"claude"}));
+        fs::write(&source, serde_json::to_vec(&v).unwrap()).unwrap();
+        State::import_legacy(&source, &destination).unwrap();
+        assert_eq!(
+            only_command(&State::read(&destination).unwrap()),
+            Some(vec!["claude".to_string()])
+        );
+    }
+
+    #[test]
+    fn ssh_host_allowlist() {
+        assert!(valid_ssh_host("user@host.example"));
+        assert!(valid_ssh_host("[fe80::1]"));
+        assert!(!valid_ssh_host(""));
+        assert!(!valid_ssh_host("-oProxyCommand=x"));
+        assert!(!valid_ssh_host("host name"));
+        assert!(!valid_ssh_host("host$(id)"));
     }
 }

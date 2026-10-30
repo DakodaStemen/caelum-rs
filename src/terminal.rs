@@ -538,6 +538,35 @@ pub fn key_bytes(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     };
     Some(seq.into_bytes())
 }
+/// Only web links from OSC 8 hyperlinks are ever opened.
+fn openable_link(uri: &str) -> bool {
+    uri.starts_with("https://") || uri.starts_with("http://")
+}
+
+/// Renders a hyperlink target for a tooltip: control characters are escaped so a
+/// URI cannot hide its real destination behind newlines or bidi tricks, and very
+/// long targets are shortened in the middle.
+fn hover_label(uri: &str) -> String {
+    let clean: String = uri
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                c.escape_unicode().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    let chars: Vec<char> = clean.chars().collect();
+    if chars.len() > 300 {
+        let head: String = chars[..200].iter().collect();
+        let tail: String = chars[chars.len() - 80..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        clean
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     s: &mut Session,
@@ -627,6 +656,25 @@ pub fn show(
         response.request_focus();
     }
     let mut clicked = response.clicked() || response.drag_started();
+    // OSC 8 link text can differ from its target, so always reveal the real URI on
+    // hover before a Ctrl+click opens it.
+    if let Some(pos) = response.hover_pos() {
+        let uri = lock(&s.term).grid()[point_at(pos, offset)]
+            .hyperlink()
+            .map(|link| link.uri().to_string());
+        if let Some(uri) = uri {
+            let tip = if openable_link(&uri) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                format!("{}\nCtrl+click to open", hover_label(&uri))
+            } else {
+                format!(
+                    "{}\n(not opened: only http and https links)",
+                    hover_label(&uri)
+                )
+            };
+            response.clone().on_hover_text_at_pointer(tip);
+        }
+    }
     if response.clicked()
         && ui.input(|i| i.modifiers.ctrl)
         && let Some(pos) = response.interact_pointer_pos()
@@ -634,7 +682,7 @@ pub fn show(
         let term = lock(&s.term);
         if let Some(link) = term.grid()[point_at(pos, offset)].hyperlink() {
             let url = link.uri();
-            if url.starts_with("https://") || url.starts_with("http://") {
+            if openable_link(url) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
@@ -892,6 +940,21 @@ mod tests {
     use super::*;
     #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
+    #[test]
+    fn hyperlink_targets_are_shown_safely() {
+        assert!(openable_link("https://example.org"));
+        assert!(!openable_link("file:///etc/passwd"));
+        assert!(!openable_link("javascript:alert(1)"));
+        assert_eq!(hover_label("https://a.example/x"), "https://a.example/x");
+        let tricky = hover_label("https://good.example\nhttps://evil.example\u{202e}");
+        assert!(
+            !tricky.contains('\n') && !tricky.contains('\u{202e}'),
+            "{tricky}"
+        );
+        assert!(tricky.contains("evil.example"));
+        let long = format!("https://x.example/{}", "a".repeat(1000));
+        assert!(hover_label(&long).chars().count() < 300);
+    }
     #[test]
     fn key_modes_and_control() {
         assert_eq!(

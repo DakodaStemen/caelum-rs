@@ -240,10 +240,15 @@ impl App {
 
 /// Resolves a font family through fontconfig and returns its bytes if egui can parse them.
 fn resolve_font(name: &str) -> Option<Vec<u8>> {
+    // A leading '-' would be parsed by fc-match as an option, not a font pattern.
+    if name.starts_with('-') {
+        return None;
+    }
     let output = std::process::Command::new("fc-match")
         .args([
             "-f",
             "%{file}",
+            "--",
             if name.is_empty() { "monospace" } else { name },
         ])
         .output()

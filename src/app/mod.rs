@@ -587,12 +587,7 @@ impl App {
                         }
                     }
                     "Connect with SSH" => {
-                        if value.is_empty()
-                            || value.starts_with('-')
-                            || !value
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || "_.@:-[]".contains(c))
-                        {
+                        if !model::valid_ssh_host(&value) {
                             self.message =
                                 "Enter a host or user@host from your SSH configuration".into();
                         } else {

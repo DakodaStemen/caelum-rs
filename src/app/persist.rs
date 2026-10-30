@@ -108,33 +108,34 @@ impl App {
             (|| -> Result<Vec<Draft>> { Ok(serde_json::from_slice(&fs::read(&file)?)?) })();
         match result {
             Ok(drafts) => {
-                for draft in drafts {
-                    match Document::restore(draft) {
-                        Ok(doc) => {
-                            let mut restored = false;
-                            for w in &self.state.workspaces {
-                                for t in &w.tabs {
-                                    let mut leaves = vec![];
-                                    t.layout.leaves(&mut leaves);
-                                    for p in leaves {
-                                        if let Pane::Editor { id, path } = p
-                                            && path == &doc.path
-                                        {
-                                            self.documents.insert(id.clone(), doc.clone());
-                                            restored = true;
-                                        }
-                                    }
-                                }
+                // Only paths already open in an editor pane of the loaded workspace may be
+                // restored; a draft never makes the app open a new file.
+                let mut editors: Vec<(String, PathBuf)> = vec![];
+                for w in &self.state.workspaces {
+                    for t in &w.tabs {
+                        let mut leaves = vec![];
+                        t.layout.leaves(&mut leaves);
+                        for p in leaves {
+                            if let Pane::Editor { id, path } = p {
+                                editors.push((id.clone(), path.clone()));
                             }
-                            if !restored {
-                                let id = model::id();
-                                let path = doc.path.clone();
-                                self.documents.insert(id.clone(), doc);
-                                self.insert(Pane::Editor { id, path });
+                        }
+                    }
+                }
+                let paths: Vec<PathBuf> = editors.iter().map(|(_, p)| p.clone()).collect();
+                for draft in drafts {
+                    match Document::restore(draft, &paths) {
+                        Ok(doc) => {
+                            for (id, path) in &editors {
+                                if path.canonicalize().ok().as_ref() == Some(&doc.path) {
+                                    self.documents.insert(id.clone(), doc.clone());
+                                }
                             }
                         }
                         Err(e) => {
+                            eprintln!("caelum-rs: {e}");
                             self.message = e.to_string();
+                            // Keeps drafts.json: it is copied aside before the next save.
                             self.recovery_conflict = true;
                         }
                     }
