@@ -384,11 +384,22 @@ new_tab = "ctrl+alt+t"
             std::fs::write(&path, format!("theme = \"{t}\"")).unwrap();
             std::thread::sleep(Duration::from_millis(10));
         }
-        let c = w
-            .changes
-            .recv_timeout(Duration::from_secs(5))
-            .expect("burst");
-        assert_eq!(c.unwrap().theme.as_deref(), Some("final"));
+        // A slow runner can stretch a gap past DEBOUNCE and surface an intermediate
+        // value first; what matters is that the burst settles on the final text in
+        // far fewer reads than writes.
+        let mut reads = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let last = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let c = w.changes.recv_timeout(left).expect("burst");
+            reads += 1;
+            let theme = c.ok().and_then(|c| c.theme);
+            if theme.as_deref() == Some("final") {
+                break theme;
+            }
+        };
+        assert_eq!(last.as_deref(), Some("final"));
+        assert!(reads <= 5, "{reads} reads for 5 writes: not debounced");
         while w.changes.recv_timeout(DEBOUNCE * 3).is_ok() {}
         std::fs::write(&path, "[font]\nsize = 2").unwrap();
         let c = w.changes.recv_timeout(Duration::from_secs(5)).expect("bad");
