@@ -351,6 +351,41 @@ pub fn system_snapshot() -> SystemSnapshot {
 /// Force-kills a still-running child's whole process group (unix). On Windows the
 /// ConPTY job closes with the pseudoconsole, so `Child::kill` is sufficient.
 pub fn kill_process_tree(pid: u32, master: &dyn portable_pty::MasterPty) {
+    // No /proc session scan on macOS/BSD. Snapshot the targets (and each one's process
+    // group) BEFORE sending any signal: once the shell dies, its jobs are reparented to
+    // launchd/init and no longer show up as descendants, so a parent-pid walk done after
+    // the first kill misses a job in its own process group (the macOS CI failure "job N
+    // in its own process group survived"). The shell may already be dead when we get
+    // here (Session::drop signals its group first), so also take every process that is
+    // still in the pane's session: the session id survives reparenting, and the unreaped
+    // leader keeps `pid` from being reused.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let snapshot: Vec<(i32, i32)> = {
+        let pairs = process_parents();
+        let mut targets = descendants(&pairs, pid);
+        for &(p, _) in &pairs {
+            // SAFETY: getsid has no memory-safety preconditions.
+            if p != pid && !targets.contains(&p) && unsafe { libc::getsid(p as i32) } == pid as i32
+            {
+                targets.push(p);
+            }
+        }
+        targets
+    }
+    .into_iter()
+    .map(|member| {
+        let member = member as i32;
+        // SAFETY: getsid/getpgid have no memory-safety preconditions.
+        let group = unsafe {
+            if libc::getsid(member) == pid as i32 {
+                libc::getpgid(member)
+            } else {
+                -1
+            }
+        };
+        (member, group)
+    })
+    .collect();
     #[cfg(unix)]
     // SAFETY: portable-pty creates a new session led by this still-owned, unreaped child.
     unsafe {
@@ -371,12 +406,15 @@ pub fn kill_process_tree(pid: u32, master: &dyn portable_pty::MasterPty) {
             libc::kill(member, libc::SIGKILL);
         }
     }
-    // No /proc session scan here: walk the parent-pid tree instead.
     #[cfg(all(unix, not(target_os = "linux")))]
-    for member in descendants(&process_parents(), pid) {
-        // SAFETY: kill has no memory-safety preconditions; we only target our descendants.
+    for &(member, group) in &snapshot {
+        // SAFETY: kill has no memory-safety preconditions; we only target descendants
+        // snapshotted above and process groups inside the pane's own session.
         unsafe {
-            libc::kill(member as i32, libc::SIGKILL);
+            if group > 1 {
+                libc::kill(-group, libc::SIGKILL);
+            }
+            libc::kill(member, libc::SIGKILL);
         }
     }
     #[cfg(not(unix))]
