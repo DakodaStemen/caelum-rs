@@ -177,6 +177,13 @@ impl App {
                                 }
                             });
                         ui.checkbox(&mut self.state.preferences.cursor_blink, "Blink cursor");
+                        ui.checkbox(
+                            &mut self.state.preferences.confirm_multiline_paste,
+                            "Confirm multi-line paste",
+                        )
+                        .on_hover_text(
+                            "Ask before pasting several lines into a program that has not enabled bracketed paste",
+                        );
                         ui.separator();
                         ui.strong("Share themes");
                         ui.add(
