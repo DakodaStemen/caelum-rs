@@ -18,9 +18,16 @@ fn find(shell: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os(format!("CAELUM_TEST_{}", shell.to_uppercase())) {
         return Some(p.into());
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(shell))
-        .find(|p| p.is_file())
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join(shell))
+            .find(|p| p.is_file())
+    });
+    assert!(
+        found.is_some() || std::env::var("CAELUM_REQUIRE_SHELLS").as_deref() != Ok("1"),
+        "{shell} not found; required by CAELUM_REQUIRE_SHELLS=1"
+    );
+    found
 }
 
 fn snippet(name: &str) -> String {
