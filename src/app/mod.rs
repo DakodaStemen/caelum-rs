@@ -234,9 +234,10 @@ impl App {
         message: String,
         smoke: Option<PathBuf>,
     ) -> Self {
+        // The logo is compiled in; a decode failure falls back to a blank texture.
         let image = image::load_from_memory(include_bytes!("../../assets/brand/logo.png"))
-            .unwrap()
-            .to_rgba8();
+            .map(|i| i.to_rgba8())
+            .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
         let size = [image.width() as usize, image.height() as usize];
         let logo = cc.egui_ctx.load_texture(
             "Caelum",
@@ -798,9 +799,8 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             PendingClose::Workspace => {
-                let i = self.state.active_index();
-                self.state.workspaces.remove(i);
-                self.state.active_workspace = self.state.workspaces[0].id.clone();
+                let cwd = self.cwd();
+                close_workspace(&mut self.state, cwd);
             }
             PendingClose::Tab => {
                 let cwd = self.cwd();
@@ -866,7 +866,7 @@ impl App {
                     if !self
                         .terminals
                         .get(&s.terminal)
-                        .unwrap()
+                        .context("Smoke terminal disappeared")?
                         .text()
                         .contains("NATIVE_RUST_OK")
                     {
@@ -1081,6 +1081,19 @@ impl eframe::App for App {
         self.terminals.clear();
     }
 }
+/// Removes the active workspace. The state never ends up without a workspace: closing
+/// the last one leaves a fresh workspace at `cwd` in its place.
+fn close_workspace(state: &mut State, cwd: PathBuf) {
+    let i = state.active_index();
+    if i < state.workspaces.len() {
+        state.workspaces.remove(i);
+    }
+    if state.workspaces.is_empty() {
+        state.workspaces.push(Workspace::new("Workspace 1", cwd));
+    }
+    let next = i.min(state.workspaces.len() - 1);
+    state.active_workspace = state.workspaces[next].id.clone();
+}
 fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
     if root.id() == id {
         *root = replacement;
@@ -1090,5 +1103,39 @@ fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
         } else {
             update_node(second, id, replacement);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn closing_last_workspace_leaves_a_fresh_one() {
+        let mut state = State::default();
+        let cwd = std::env::temp_dir();
+        while state.workspaces.len() > 1 {
+            close_workspace(&mut state, cwd.clone());
+        }
+        let only = state.workspaces[0].id.clone();
+        close_workspace(&mut state, cwd.clone());
+        assert_eq!(state.workspaces.len(), 1);
+        assert_ne!(state.workspaces[0].id, only);
+        assert_eq!(state.active_workspace, state.workspaces[0].id);
+    }
+    #[test]
+    fn closing_a_workspace_activates_a_neighbour() {
+        let mut state = State::default();
+        let cwd = std::env::temp_dir();
+        for n in 0..3 {
+            state
+                .workspaces
+                .push(Workspace::new(format!("W{n}"), cwd.clone()));
+        }
+        let last = state.workspaces.last().unwrap().id.clone();
+        state.active_workspace = last.clone();
+        let before = state.workspaces.len();
+        close_workspace(&mut state, cwd);
+        assert_eq!(state.workspaces.len(), before - 1);
+        assert!(state.workspaces.iter().all(|w| w.id != last));
+        assert_eq!(state.active_workspace, state.workspaces.last().unwrap().id);
     }
 }
