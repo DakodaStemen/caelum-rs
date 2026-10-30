@@ -6,6 +6,7 @@ mod sidebar;
 mod terminal_pane;
 use anyhow::{Context, Result, bail};
 use caelum_rs::{
+    config::{self, Config, Keymap},
     files::{self, Document, Draft},
     model::{self, Axis, Pane, State, Tab, Workspace},
     syntax::Highlighter,
@@ -41,6 +42,13 @@ enum Action {
     Save,
     Palette,
     Sidebar,
+    NextTab,
+    PrevTab,
+    Search,
+    Copy,
+    Paste,
+    PrevPrompt,
+    NextPrompt,
 }
 #[derive(Clone)]
 enum PendingClose {
@@ -212,8 +220,15 @@ pub struct App {
     font_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     last_dialog: Option<String>,
     pending_save: Option<String>,
+    /// Multi-line paste awaiting confirmation (see `terminal_pane::paste_confirm`).
+    pending_paste: Option<terminal_pane::PendingPaste>,
     syntax: Highlighter,
+    config_path: PathBuf,
+    config: Config,
+    keymap: Keymap,
+    config_watch: Option<config::Watcher>,
     writer: model::BackgroundWriter,
+    docio: files::DocumentIo,
 }
 struct Smoke {
     report: PathBuf,
@@ -233,6 +248,7 @@ impl App {
         mut state: State,
         message: String,
         smoke: Option<PathBuf>,
+        config_path: PathBuf,
     ) -> Self {
         // The logo is compiled in; a decode failure falls back to a blank texture.
         let image = image::load_from_memory(include_bytes!("../../assets/brand/logo.png"))
@@ -319,9 +335,26 @@ impl App {
             font_rx: None,
             last_dialog: None,
             pending_save: None,
+            pending_paste: None,
             syntax: Highlighter::default(),
+            config_path,
+            config: Config::default(),
+            keymap: Keymap::default(),
+            config_watch: None,
             writer: model::BackgroundWriter::new(),
+            docio: {
+                let ctx = cc.egui_ctx.clone();
+                files::DocumentIo::new(move || ctx.request_repaint())
+            },
         };
+        if app.smoke.is_none() {
+            // Smoke runs use an isolated profile and must not read the user's config.
+            app.reload_config(&cc.egui_ctx, false);
+            match config::Watcher::new(&app.config_path, cc.egui_ctx.clone()) {
+                Ok(w) => app.config_watch = Some(w),
+                Err(e) => app.message = format!("Config watcher unavailable: {e}"),
+            }
+        }
         app.restore_drafts();
         app.ensure_focus();
         app
@@ -377,6 +410,42 @@ impl App {
                 _ => None,
             })
             .unwrap_or_else(model::home)
+    }
+    /// Read config.toml synchronously; used once at startup so the first frame
+    /// already has the user's settings. Hot reloads arrive from the watcher thread.
+    fn reload_config(&mut self, ctx: &egui::Context, announce: bool) {
+        let loaded = Config::load(&self.config_path);
+        self.apply_config(loaded, ctx, announce);
+    }
+    /// Apply a parsed config. A bad file keeps the previous settings and reports the error.
+    fn apply_config(&mut self, loaded: Result<Config>, ctx: &egui::Context, announce: bool) {
+        match loaded {
+            Ok(config) => {
+                let keymap = Keymap::build(&config.keybindings).unwrap_or_default();
+                config.apply(&mut self.state.preferences);
+                if let Some(id) = &config.theme {
+                    let known = self.presets.contains_key(id)
+                        || self
+                            .state
+                            .preferences
+                            .custom_themes
+                            .iter()
+                            .any(|t| &t.id == id);
+                    if known {
+                        self.state.preferences.theme = id.clone();
+                    } else {
+                        self.message = format!("config.toml: unknown theme {id:?}");
+                    }
+                }
+                self.keymap = keymap;
+                self.config = config;
+                if announce {
+                    self.message = "Config reloaded".into();
+                }
+                ctx.request_repaint();
+            }
+            Err(e) => self.message = format!("Config not applied: {e:#}"),
+        }
     }
     fn insert(&mut self, pane: Pane) {
         let target = self.focused.clone();
@@ -472,6 +541,35 @@ impl App {
                 self.palette = !self.palette;
                 self.palette_query.clear();
             }
+            Action::NextTab | Action::PrevTab => {
+                let forward = matches!(action, Action::NextTab);
+                let w = self.workspace_mut();
+                let n = w.tabs.len();
+                let i = (w.active_index() + if forward { 1 } else { n - 1 }) % n;
+                w.active_tab = w.tabs[i].id.clone();
+                self.zoom = None;
+                self.ensure_focus();
+            }
+            Action::Search => {
+                self.dialog = Some("Search terminal".into());
+                self.dialog_input.clear();
+            }
+            Action::Copy => {
+                if let Some(text) = self
+                    .terminals
+                    .get(&self.focused)
+                    .and_then(Session::selection)
+                {
+                    ctx.copy_text(text);
+                }
+            }
+            Action::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Action::PrevPrompt | Action::NextPrompt => {
+                // Needs OSC 133 shell integration; silently a no-op otherwise.
+                if let Some(s) = self.terminals.get_mut(&self.focused) {
+                    s.jump_prompt(matches!(action, Action::NextPrompt));
+                }
+            }
         }
         ctx.request_repaint();
     }
@@ -492,6 +590,8 @@ impl App {
             ("Launch Claude".into(), Action::Assistant("claude".into())),
             ("Toggle sidebar".into(), Action::Sidebar),
             ("Appearance and settings".into(), Action::Settings),
+            ("Previous prompt".into(), Action::PrevPrompt),
+            ("Next prompt".into(), Action::NextPrompt),
         ];
         for (id, t) in &self.presets {
             a.push((format!("Theme: {}", t.name), Action::Theme(id.clone())));
@@ -502,54 +602,17 @@ impl App {
         a
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let cs = Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Modifiers::NONE
-        };
-        for (m, key, a) in [
-            (cs, Key::P, Action::Palette),
-            (cs, Key::B, Action::Sidebar),
-            (cs, Key::T, Action::NewTab),
-            (cs, Key::D, Action::Split(Axis::Horizontal)),
-            (cs, Key::E, Action::Split(Axis::Vertical)),
-            (cs, Key::Enter, Action::Zoom),
-            (cs, Key::W, Action::ClosePane),
-            (Modifiers::CTRL, Key::O, Action::Open),
-            (Modifiers::CTRL, Key::S, Action::Save),
-        ] {
-            if ctx.input_mut(|i| i.consume_key(m, key)) {
+        let mut bound: Vec<_> = shortcut_table()
+            .into_iter()
+            .filter_map(|(name, a)| self.keymap.get(name).map(|b| (b, a)))
+            .collect();
+        // Check combinations with more modifiers first so Ctrl+Shift+Tab is not eaten by Ctrl+Tab.
+        let weight = |m: Modifiers| usize::from(m.ctrl) + usize::from(m.shift) + usize::from(m.alt);
+        bound.sort_by_key(|(b, _)| std::cmp::Reverse(weight(b.modifiers)));
+        for (b, a) in bound {
+            if ctx.input_mut(|i| i.consume_key(b.modifiers, b.key)) {
                 self.action(a, ctx);
             }
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Tab)) {
-            let w = self.workspace_mut();
-            let i = (w.active_index() + 1) % w.tabs.len();
-            w.active_tab = w.tabs[i].id.clone();
-            self.zoom = None;
-            self.ensure_focus();
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::Tab)) {
-            let w = self.workspace_mut();
-            let i = (w.active_index() + w.tabs.len() - 1) % w.tabs.len();
-            w.active_tab = w.tabs[i].id.clone();
-            self.zoom = None;
-            self.ensure_focus();
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::C))
-            && let Some(text) = self
-                .terminals
-                .get(&self.focused)
-                .and_then(Session::selection)
-        {
-            ctx.copy_text(text);
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::V)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-        }
-        if ctx.input_mut(|i| i.consume_key(cs, Key::F)) {
-            self.dialog = Some("Search terminal".into());
-            self.dialog_input.clear();
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.palette = false;
@@ -612,6 +675,9 @@ impl App {
         }
         if self.settings {
             self.appearance(ctx);
+        }
+        if self.pending_paste.is_some() {
+            self.paste_confirm(ctx);
         }
         if let Some(title) = self.dialog.clone() {
             let mut done = false;
@@ -732,21 +798,18 @@ impl App {
                     self.pending = None;
                 }
                 if save {
-                    let mut failed = false;
+                    // Saves run on the IO thread; once they land the documents are clean
+                    // and the close completes above. A failed save keeps this dialog open.
                     for id in &dirty {
-                        if let Some(doc) = self.documents.get_mut(id)
-                            && let Err(e) = doc.save()
-                        {
-                            self.message = e.to_string();
-                            failed = true;
-                        }
-                    }
-                    if !failed {
-                        self.finish_close(ctx);
+                        self.save_document(id);
                     }
                 }
                 if discard {
                     for id in dirty {
+                        // A prior "Save and close" may still be queued on the IO thread;
+                        // cancel it so discarding never writes. A save already running
+                        // finishes (see `DocumentIo::discard`).
+                        self.docio.discard(&id);
                         self.documents.remove(&id);
                     }
                     self.finish_close(ctx);
@@ -835,6 +898,7 @@ impl App {
         }
         self.terminals.retain(|id, _| ids.contains(id));
         self.documents.retain(|id, _| ids.contains(id));
+        self.docio.retain(|id| ids.contains(id));
         self.files.retain(|id, _| ids.contains(id));
     }
     fn smoke_tick(&mut self, ctx: &egui::Context) {
@@ -914,20 +978,34 @@ impl App {
                     self.open_file(fixture);
                 }
                 6 => {
+                    let id = self.focused.clone();
+                    if self.docio.loading(&id) {
+                        return Ok(false);
+                    }
                     let doc = self
                         .documents
-                        .get_mut(&self.focused)
+                        .get_mut(&id)
                         .context("Editor was not opened")?;
                     doc.text = "Rust desktop edit\n".into();
-                    doc.save()?;
-                    if fs::read_to_string(&doc.path)? != "Rust desktop edit\n" {
-                        bail!("Editor save failed");
+                    let path = doc.path.clone();
+                    self.save_document(&id);
+                    self.flush_documents();
+                    if fs::read_to_string(&path)? != "Rust desktop edit\n" {
+                        bail!("Editor save failed: {}", self.message);
                     }
-                    fs::write(&doc.path, "external change\n")?;
-                    doc.text = "must refuse".into();
-                    if doc.save().is_ok() {
+                    fs::write(&path, "external change\n")?;
+                    self.documents
+                        .get_mut(&id)
+                        .context("Editor was closed")?
+                        .text = "must refuse".into();
+                    self.save_document(&id);
+                    self.flush_documents();
+                    if fs::read_to_string(&path)? != "external change\n"
+                        || !self.message.contains("changed on disk")
+                    {
                         bail!("External change was overwritten");
                     }
+                    let doc = self.documents.get_mut(&id).context("Editor was closed")?;
                     s.checks.push(
                         "Native editor saves text and refuses external-change overwrite".into(),
                     );
@@ -1018,6 +1096,15 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
         }
+        self.poll_documents();
+        // The watcher thread reads and parses config.toml; only apply the newest result here.
+        if let Some(latest) = self
+            .config_watch
+            .as_ref()
+            .and_then(|w| w.changes.try_iter().last())
+        {
+            self.apply_config(latest, ctx, true);
+        }
         self.shortcuts(ctx);
         self.apply_font(ctx);
         let theme = self.theme();
@@ -1054,13 +1141,8 @@ impl eframe::App for App {
             self.open_file(path);
         }
         self.overlays(ctx);
-        if let Some(id) = self.pending_save.take()
-            && let Some(doc) = self.documents.get_mut(&id)
-        {
-            self.message = match doc.save() {
-                Ok(()) => "File saved".into(),
-                Err(e) => e.to_string(),
-            };
+        if let Some(id) = self.pending_save.take() {
+            self.save_document(&id);
         }
 
         if self.last_save.elapsed() > Duration::from_secs(3) {
@@ -1081,6 +1163,28 @@ impl eframe::App for App {
         self.terminals.clear();
     }
 }
+/// Config action name -> app action for every rebindable shortcut in [`config::ACTIONS`].
+fn shortcut_table() -> Vec<(&'static str, Action)> {
+    vec![
+        ("command_palette", Action::Palette),
+        ("toggle_sidebar", Action::Sidebar),
+        ("new_tab", Action::NewTab),
+        ("split_right", Action::Split(Axis::Horizontal)),
+        ("split_below", Action::Split(Axis::Vertical)),
+        ("zoom_pane", Action::Zoom),
+        ("close_pane", Action::ClosePane),
+        ("open_file", Action::Open),
+        ("save_file", Action::Save),
+        ("search", Action::Search),
+        ("next_tab", Action::NextTab),
+        ("prev_tab", Action::PrevTab),
+        ("copy", Action::Copy),
+        ("paste", Action::Paste),
+        ("prev_prompt", Action::PrevPrompt),
+        ("next_prompt", Action::NextPrompt),
+    ]
+}
+
 /// Removes the active workspace. The state never ends up without a workspace: closing
 /// the last one leaves a fresh workspace at `cwd` in its place.
 fn close_workspace(state: &mut State, cwd: PathBuf) {
@@ -1105,9 +1209,23 @@ fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_configurable_action_is_dispatched() {
+        let wired: Vec<&str> = shortcut_table().into_iter().map(|(n, _)| n).collect();
+        for (name, _) in config::ACTIONS {
+            assert!(wired.contains(name), "{name} has no dispatch entry");
+        }
+        assert_eq!(wired.len(), config::ACTIONS.len());
+        let k = Keymap::default();
+        assert_eq!(k.get("prev_prompt").unwrap().key, Key::ArrowUp);
+        assert_eq!(k.get("next_prompt").unwrap().key, Key::ArrowDown);
+    }
+
     #[test]
     fn closing_last_workspace_leaves_a_fresh_one() {
         let mut state = State::default();

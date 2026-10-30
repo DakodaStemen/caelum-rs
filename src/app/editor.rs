@@ -11,22 +11,27 @@ impl App {
     ) -> bool {
         let mut focus_requested = false;
         if !self.documents.contains_key(id) {
-            match Document::open(path) {
-                Ok(doc) => {
-                    self.documents.insert(id.to_string(), doc);
-                }
-                Err(e) => {
-                    ui.colored_label(theme.ui("danger"), e.to_string());
-                    return false;
-                }
+            // Files load on the document IO thread; show a placeholder until the
+            // result arrives (or the error, which also reaches the status line).
+            if let Some(error) = self.docio.open_error(id) {
+                ui.colored_label(theme.ui("danger"), error);
+                return false;
             }
+            if !self.docio.loading(id) {
+                self.docio.open(id, path, false);
+            }
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading…").color(theme.ui("muted")));
+            });
+            return false;
         }
         let language = self
             .syntax
             .language(path)
             .unwrap_or_else(|| "Plain text".into());
         let Some(doc) = self.documents.get_mut(id) else {
-            // Unreachable today (inserted above); render a placeholder rather than panic.
+            // Unreachable (checked above); render a placeholder rather than panic.
             ui.colored_label(
                 theme.ui("danger"),
                 "Document is not loaded; reopen the file",
@@ -34,6 +39,9 @@ impl App {
             return false;
         };
         ui.horizontal(|ui| {
+            if self.docio.saving(id) {
+                ui.spinner();
+            }
             if ui
                 .add_enabled(!doc.read_only && doc.dirty(), egui::Button::new("Save"))
                 .on_hover_text("Ctrl+S")
@@ -80,15 +88,77 @@ impl App {
             });
         focus_requested
     }
+    /// Opens `path` in a new editor pane; the file loads in the background. If it
+    /// cannot be opened the pane is removed again and the error is shown.
     pub(super) fn open_file(&mut self, path: PathBuf) {
-        match Document::open(&path) {
-            Ok(doc) => {
-                let id = model::id();
-                let path = doc.path.clone();
-                self.documents.insert(id.clone(), doc);
-                self.insert(Pane::Editor { id, path });
+        let id = model::id();
+        self.docio.open(&id, &path, true);
+        self.insert(Pane::Editor { id, path });
+    }
+    /// Saves document `id` on the IO thread (coalescing with a save already running).
+    pub(super) fn save_document(&mut self, id: &str) {
+        let Some(doc) = self.documents.get(id) else {
+            if self.docio.loading(id) {
+                self.message = "File is still loading".into();
             }
-            Err(e) => self.message = e.to_string(),
+            return;
+        };
+        self.message = match self.docio.save(id, doc) {
+            files::SaveRequest::Started => "Saving…".into(),
+            files::SaveRequest::Queued => "Saving… latest edits follow".into(),
+        };
+    }
+    /// Applies finished document opens and saves.
+    pub(super) fn poll_documents(&mut self) {
+        let events = self.docio.poll(&mut self.documents);
+        self.document_events(events);
+    }
+    /// Waits for every pending save to land (exit, window close, smoke checks).
+    pub(super) fn flush_documents(&mut self) {
+        let events = self.docio.flush(&mut self.documents);
+        self.document_events(events);
+    }
+    fn document_events(&mut self, events: Vec<files::DocEvent>) {
+        let mut remove = vec![];
+        for event in events {
+            match event {
+                files::DocEvent::Opened { .. } => {}
+                files::DocEvent::OpenFailed {
+                    id,
+                    error,
+                    remove_pane,
+                } => {
+                    eprintln!("caelum-rs: {error}");
+                    self.message = error;
+                    if remove_pane {
+                        remove.push(id);
+                    }
+                }
+                files::DocEvent::Saved { .. } => self.message = "File saved".into(),
+                files::DocEvent::SaveFailed { error, .. } => {
+                    eprintln!("caelum-rs: {error}");
+                    self.message = error;
+                }
+            }
         }
+        if remove.is_empty() {
+            return;
+        }
+        // A file that failed to open from "open file" gets no pane, as before.
+        let cwd = self.cwd();
+        for w in &mut self.state.workspaces {
+            for t in &mut w.tabs {
+                for id in &remove {
+                    if t.layout.find(id).is_some() && !t.layout.remove(id) {
+                        t.layout = Pane::terminal(cwd.clone());
+                    }
+                }
+            }
+        }
+        if remove.iter().any(|id| self.zoom.as_ref() == Some(id)) {
+            self.zoom = None;
+        }
+        self.ensure_focus();
+        self.prune();
     }
 }

@@ -1,5 +1,9 @@
 //! PTY ownership, terminal emulation and input translation. The UI never blocks on PTY I/O.
-use crate::{model::Preferences, theme::Theme};
+use crate::{
+    model::Preferences,
+    osc::{OscEvent, OscScanner},
+    theme::Theme,
+};
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
@@ -116,12 +120,61 @@ impl Dimensions for Size {
         self.cols
     }
 }
+/// Shell-reported state from OSC 7 / OSC 133, shared with the PTY reader thread.
+#[derive(Default, Debug)]
+pub struct ShellState {
+    /// Last OSC 7 working directory for this host.
+    pub cwd: Option<PathBuf>,
+    /// Prompt starts as absolute line indexes (0 = oldest scrollback line).
+    marks: Vec<i64>,
+    /// Exit status of the most recent finished command, if the shell reported one.
+    pub last_exit: Option<i32>,
+    /// True between OSC 133;C and OSC 133;D.
+    pub running: bool,
+    last_history: usize,
+}
+impl ShellState {
+    fn clear_marks(&mut self) {
+        self.marks.clear();
+    }
+}
+fn apply_osc(term: &Term<Events>, shell: &mut ShellState, event: OscEvent) {
+    match event {
+        OscEvent::Cwd(path) => shell.cwd = Some(path),
+        OscEvent::PromptStart => {
+            // Marks are only meaningful on the primary screen.
+            if term.mode().contains(TermMode::ALT_SCREEN) {
+                return;
+            }
+            let abs =
+                term.grid().history_size() as i64 + i64::from(term.grid().cursor.point.line.0);
+            if shell.marks.last() != Some(&abs) {
+                shell.marks.push(abs);
+            }
+        }
+        OscEvent::OutputStart => shell.running = true,
+        OscEvent::CommandEnd(code) => {
+            shell.running = false;
+            shell.last_exit = code;
+        }
+    }
+}
+/// Absolute indexes drift once Alacritty starts discarding old scrollback, so marks
+/// are dropped when history is truncated or full instead of pointing at wrong lines.
+fn reconcile_marks(term: &Term<Events>, shell: &mut ShellState) {
+    let history = term.grid().history_size();
+    if history < shell.last_history || history >= Config::default().scrolling_history {
+        shell.clear_marks();
+    }
+    shell.last_history = history;
+}
 pub struct Session {
     pub term: Arc<Mutex<Term<Events>>>,
     pub title: String,
     pub cwd: PathBuf,
     pub exited: bool,
     pub error: Option<String>,
+    pub shell: Arc<Mutex<ShellState>>,
     // `Option` only so `Drop` can hand them to the cleanup thread; always `Some` while alive.
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -132,7 +185,13 @@ pub struct Session {
     size: Size,
     search_origin: Option<(String, Point)>,
     pending_input: Vec<u8>,
+    /// Multi-line paste held for user confirmation (already sanitised).
+    pending_paste: Option<String>,
     wake: egui::Context,
+    /// Test hook: when set, the cleanup thread waits for a message before doing any
+    /// work, so a test can prove `drop` returns while cleanup has not yet run.
+    #[cfg(test)]
+    cleanup_gate: Option<std::sync::mpsc::Receiver<()>>,
 }
 impl Session {
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> Result<Self> {
@@ -164,6 +223,8 @@ impl Session {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Caelum Rust");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // Lets shell rc files enable the integration only inside Caelum.
+        cmd.env("CAELUM_RS", env!("CARGO_PKG_VERSION"));
         // Nonblocking descriptors let both workers honor shutdown even if a descendant holds the PTY open.
         #[cfg(unix)]
         if let Some(fd) = pair.master.as_raw_fd() {
@@ -189,8 +250,8 @@ impl Session {
             // SAFETY: dup is a freshly created, valid descriptor owned by nobody else.
             unsafe { OwnedFd::from_raw_fd(dup) }
         };
-        let mut reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
+        let reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let (listener, events) = Events::new();
@@ -199,60 +260,29 @@ impl Session {
         let read_stop = stop.clone();
         let read_term = term.clone();
         let read_ctx = ctx.clone();
+        let shell = Arc::new(Mutex::new(ShellState::default()));
+        let read_shell = shell.clone();
         let read_thread = thread::spawn(move || {
-            let mut parser: ansi::Processor = ansi::Processor::new();
-            let mut bytes = [0; 16384];
-            while !read_stop.load(Ordering::Relaxed) {
-                match reader.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        {
-                            let mut t = lock(&read_term);
-                            parser.advance(&mut *t, &bytes[..n]);
-                        }
-                        read_ctx.request_repaint();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        #[cfg(unix)]
-                        wait_readable(&poll_fd, READ_IDLE_WAIT);
-                        #[cfg(not(unix))]
-                        thread::sleep(READ_IDLE_WAIT);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            read_ctx.request_repaint();
+            read_loop(
+                reader,
+                read_term,
+                read_shell,
+                read_stop,
+                read_ctx,
+                #[cfg(unix)]
+                poll_fd,
+            )
         });
         let (input, rx) = mpsc::sync_channel::<Vec<u8>>(32);
         let write_stop = stop.clone();
-        let write_thread = thread::spawn(move || {
-            while !write_stop.load(Ordering::Relaxed) {
-                let bytes = match rx.recv_timeout(Duration::from_millis(30)) {
-                    Ok(b) => b,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(_) => break,
-                };
-                let mut offset = 0;
-                while offset < bytes.len() && !write_stop.load(Ordering::Relaxed) {
-                    match writer.write(&bytes[offset..]) {
-                        Ok(0) => return,
-                        Ok(n) => offset += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(4))
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => return,
-                    }
-                }
-            }
-        });
+        let write_thread = thread::spawn(move || write_loop(writer, rx, write_stop));
         Ok(Self {
             term,
             title: "Terminal".into(),
             cwd,
             exited: false,
             error: None,
+            shell,
             master: Some(pair.master),
             child: Some(child),
             input: Some(input),
@@ -262,7 +292,10 @@ impl Session {
             size,
             search_origin: None,
             pending_input: Vec::new(),
+            pending_paste: None,
             wake: ctx,
+            #[cfg(test)]
+            cleanup_gate: None,
         })
     }
     pub fn write(&mut self, bytes: Vec<u8>) {
@@ -295,9 +328,29 @@ impl Session {
             }
         }
     }
+    /// Writes a paste to the PTY now, bracketed if the program enabled it.
     pub fn paste(&mut self, text: &str) {
-        let bracketed = lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE);
+        let bracketed = self.bracketed_paste();
         self.write(paste_bytes(text, bracketed));
+    }
+    /// Pastes like [`Session::paste`], unless [`needs_confirm`] says the user should
+    /// see it first; then it is held until [`Session::take_pending_paste`].
+    /// Returns true when the paste was held.
+    pub fn paste_or_hold(&mut self, text: &str, confirm_multiline: bool) -> bool {
+        if needs_confirm(text, self.bracketed_paste(), confirm_multiline) {
+            self.pending_paste = Some(sanitize_paste(text));
+            true
+        } else {
+            self.paste(text);
+            false
+        }
+    }
+    /// The held multi-line paste, if any, for the app to confirm.
+    pub fn take_pending_paste(&mut self) -> Option<String> {
+        self.pending_paste.take()
+    }
+    fn bracketed_paste(&self) -> bool {
+        lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE)
     }
     pub fn poll(&mut self, theme: &Theme) {
         self.flush_input();
@@ -340,7 +393,12 @@ impl Session {
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
-        if let Some(pid) = self.pid()
+        // A shell-reported OSC 7 directory wins; the platform lookup is the fallback
+        // for shells without integration (it only sees the process we spawned, not subshells).
+        let reported = lock(&self.shell).cwd.clone().filter(|p| p.is_dir());
+        if let Some(cwd) = reported {
+            self.cwd = cwd;
+        } else if let Some(pid) = self.pid()
             && !self.exited
             && let Some(cwd) = crate::platform::process_cwd(pid)
         {
@@ -364,6 +422,10 @@ impl Session {
         }) {
             self.error = Some(e.to_string());
             return;
+        }
+        if self.size.cols != size.cols {
+            // Reflow changes line counts, so stored line positions are no longer valid.
+            lock(&self.shell).clear_marks();
         }
         lock(&self.term).resize(size);
         self.size = size;
@@ -457,11 +519,105 @@ impl Session {
             false
         }
     }
+    /// Scroll to the previous/next shell prompt (needs OSC 133 integration).
+    /// Returns false when there is no such prompt.
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        let mut term = lock(&self.term);
+        let shell = lock(&self.shell);
+        let history = term.grid().history_size() as i64;
+        let top = -(term.grid().display_offset() as i64);
+        let lines = shell.marks.iter().map(|abs| abs - history);
+        let target = if forward {
+            lines.filter(|l| *l > top).min()
+        } else {
+            lines.filter(|l| *l < top).max()
+        };
+        match target {
+            Some(line) => {
+                let offset = (-line).clamp(0, history) as i32;
+                term.scroll_display(Scroll::Bottom);
+                term.scroll_display(Scroll::Delta(offset));
+                true
+            }
+            None if forward => {
+                term.scroll_display(Scroll::Bottom);
+                false
+            }
+            None => false,
+        }
+    }
     pub fn selection(&self) -> Option<String> {
         lock(&self.term).selection_to_string()
     }
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref()?.process_id()
+    }
+}
+/// PTY reader thread: feeds output to the parser (applying OSC 7/133 events at
+/// their exact byte positions) until EOF, an error, or the stop flag.
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    term: Arc<Mutex<Term<Events>>>,
+    shell: Arc<Mutex<ShellState>>,
+    stop: Arc<AtomicBool>,
+    ctx: egui::Context,
+    #[cfg(unix)] poll_fd: std::os::fd::OwnedFd,
+) {
+    let mut parser: ansi::Processor = ansi::Processor::new();
+    let mut scanner = OscScanner::default();
+    let mut bytes = [0; 16384];
+    while !stop.load(Ordering::Relaxed) {
+        match reader.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(n) => {
+                {
+                    let events = scanner.scan(&bytes[..n]);
+                    let mut t = lock(&term);
+                    let mut shell = lock(&shell);
+                    let mut done = 0;
+                    for (end, event) in events {
+                        parser.advance(&mut *t, &bytes[done..end]);
+                        done = end;
+                        apply_osc(&t, &mut shell, event);
+                    }
+                    parser.advance(&mut *t, &bytes[done..n]);
+                    reconcile_marks(&t, &mut shell);
+                }
+                ctx.request_repaint();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(unix)]
+                wait_readable(&poll_fd, READ_IDLE_WAIT);
+                #[cfg(not(unix))]
+                thread::sleep(READ_IDLE_WAIT);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    ctx.request_repaint();
+}
+/// PTY writer thread: drains queued input chunks, retrying partial and
+/// would-block writes, until the channel closes or the stop flag is set.
+fn write_loop(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        let bytes = match rx.recv_timeout(Duration::from_millis(30)) {
+            Ok(b) => b,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        };
+        let mut offset = 0;
+        while offset < bytes.len() && !stop.load(Ordering::Relaxed) {
+            match writer.write(&bytes[offset..]) {
+                Ok(0) => return,
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(4))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            }
+        }
     }
 }
 /// Longest the reader sleeps between checks of the stop flag while the PTY is idle.
@@ -486,6 +642,48 @@ fn wait_readable(fd: &std::os::fd::OwnedFd, timeout: Duration) {
         libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int);
     }
 }
+/// Whether a paste must be confirmed before it reaches the PTY: without bracketed
+/// paste every line break acts as Enter, so a multi-line paste can run commands the
+/// user never saw. Bracketed-paste programs (and users who opted out) paste at once.
+pub fn needs_confirm(text: &str, bracketed: bool, confirm_multiline: bool) -> bool {
+    confirm_multiline && !bracketed && sanitize_paste(text).contains(['\n', '\r'])
+}
+/// Lines shown in the paste confirmation preview.
+const PREVIEW_LINES: usize = 5;
+const PREVIEW_LINE_CHARS: usize = 120;
+/// Line count and a safe preview of a held paste: the first [`PREVIEW_LINES`]
+/// lines with controls and bidi characters escaped, long lines shortened.
+pub fn paste_preview(text: &str) -> (usize, String) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.strip_suffix('\n').unwrap_or(&normalized);
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut preview: Vec<String> = lines
+        .iter()
+        .take(PREVIEW_LINES)
+        .map(|line| {
+            let escaped: String = line
+                .chars()
+                .flat_map(|c| {
+                    if c.is_control() || is_bidi_control(c) {
+                        c.escape_default().collect::<Vec<_>>()
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            if escaped.chars().count() > PREVIEW_LINE_CHARS {
+                let head: String = escaped.chars().take(PREVIEW_LINE_CHARS).collect();
+                format!("{head}…")
+            } else {
+                escaped
+            }
+        })
+        .collect();
+    if lines.len() > PREVIEW_LINES {
+        preview.push(format!("… {} more line(s)", lines.len() - PREVIEW_LINES));
+    }
+    (lines.len(), preview.join("\n"))
+}
 /// Bytes sent to the PTY for a paste, after sanitising and optional bracketing.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = sanitize_paste(text);
@@ -506,6 +704,8 @@ impl Drop for Session {
             return;
         };
         let threads = std::mem::take(&mut self.threads);
+        #[cfg(test)]
+        let gate = self.cleanup_gate.take();
         // Decide liveness before any signal so the cleanup thread never reaps the
         // child before it has walked the child's session.
         let running = matches!(child.try_wait(), Ok(None));
@@ -530,6 +730,10 @@ impl Drop for Session {
             }
         }
         let cleanup = move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
             if running && let Some(pid) = child.process_id() {
                 crate::platform::kill_process_tree(pid, &*master);
             }
@@ -738,6 +942,57 @@ fn hover_label(uri: &str) -> String {
     }
 }
 
+/// Pixel geometry of the terminal grid for one frame.
+#[derive(Clone, Copy)]
+struct Metrics {
+    /// Whole pane, including padding.
+    rect: Rect,
+    /// Padded area the cells are drawn in.
+    area: Rect,
+    /// Cell width and height in points.
+    cw: f32,
+    ch: f32,
+    size: Size,
+}
+impl Metrics {
+    /// Grid point under `pos`, clamped to the visible grid, for the given display offset.
+    fn point_at(&self, pos: Pos2, offset: usize) -> Point {
+        Point::new(
+            Line(
+                ((pos.y - self.area.top()) / self.ch)
+                    .floor()
+                    .clamp(0., self.size.rows as f32 - 1.) as i32
+                    - offset as i32,
+            ),
+            Column(
+                ((pos.x - self.area.left()) / self.cw)
+                    .floor()
+                    .clamp(0., self.size.cols as f32 - 1.) as usize,
+            ),
+        )
+    }
+    /// Top-left corner of the cell at grid `col`/screen `row`.
+    fn cell_pos(&self, col: usize, row: i32) -> Pos2 {
+        self.area.min + Vec2::new(col as f32 * self.cw, row as f32 * self.ch)
+    }
+}
+
+/// How pointer input is interpreted this frame.
+#[derive(Clone, Copy)]
+struct PointerMode {
+    /// Display offset (scrollback position) at the start of the frame.
+    offset: usize,
+    /// The program asked for mouse reports.
+    reporting: bool,
+    /// Pointer input selects text (no reporting, or Shift is held).
+    selecting: bool,
+}
+impl PointerMode {
+    fn forwards_to_program(self) -> bool {
+        self.reporting && !self.selecting
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     s: &mut Session,
@@ -746,67 +1001,98 @@ pub fn show(
     focused: bool,
     search: &str,
 ) -> bool {
-    use alacritty_terminal::term::cell::Flags;
     let font = FontId::monospace(prefs.font_size);
-    let cw = ui.fonts_mut(|f| f.glyph_width(&font, 'M'));
+    let (response, m) = layout(ui, s, theme, prefs, &font);
+    let pointer = pointer_mode(ui, s);
+    handle_selection(s, &response, &m, pointer);
+    manage_focus(ui, &response, focused);
+    let mut clicked = response.clicked() || response.drag_started();
+    handle_links(ui, s, &response, &m, pointer);
+    handle_scroll(ui, s, &response, &m, pointer);
+    if focused && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
+        handle_events(ui, s, prefs, &response, &m, pointer);
+    }
+    let painter = ui.painter_at(m.rect);
+    paint_grid(ui, s, theme, prefs, &painter, &m, &font, focused, search);
+    paint_exit_badge(s, theme, prefs, &painter, m.rect);
+    context_menu(s, &response, &mut clicked);
+    clicked
+}
+
+/// Allocates the pane, paints its background, sizes the PTY to fit and drains
+/// pending session events.
+fn layout(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    theme: &Theme,
+    prefs: &Preferences,
+    font: &FontId,
+) -> (egui::Response, Metrics) {
+    let cw = ui.fonts_mut(|f| f.glyph_width(font, 'M'));
     let ch = prefs.font_size * prefs.line_height;
     let (rect, response) = ui.allocate_exact_size(
         ui.available_size().max(Vec2::splat(1.)),
         Sense::click_and_drag(),
     );
     let area = rect.shrink(8.);
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0., theme.term("background"));
+    ui.painter_at(rect)
+        .rect_filled(rect, 0., theme.term("background"));
     s.resize((area.width() / cw) as usize, (area.height() / ch) as usize);
     s.poll(theme);
-    let size = s.size;
-    let point_at = |pos: Pos2, offset: usize| {
-        Point::new(
-            Line(
-                ((pos.y - area.top()) / ch)
-                    .floor()
-                    .clamp(0., size.rows as f32 - 1.) as i32
-                    - offset as i32,
-            ),
-            Column(
-                ((pos.x - area.left()) / cw)
-                    .floor()
-                    .clamp(0., size.cols as f32 - 1.) as usize,
-            ),
-        )
+    let m = Metrics {
+        rect,
+        area,
+        cw,
+        ch,
+        size: s.size,
     };
+    (response, m)
+}
+
+fn pointer_mode(ui: &egui::Ui, s: &Session) -> PointerMode {
     let offset = lock(&s.term).grid().display_offset();
-    let mouse_reporting = lock(&s.term)
+    let reporting = lock(&s.term)
         .mode()
         .intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION);
-    let selecting = !mouse_reporting || ui.input(|i| i.modifiers.shift);
+    let selecting = !reporting || ui.input(|i| i.modifiers.shift);
+    PointerMode {
+        offset,
+        reporting,
+        selecting,
+    }
+}
+
+/// Drag selects characters, double-click selects a word.
+fn handle_selection(s: &Session, response: &egui::Response, m: &Metrics, p: PointerMode) {
+    if !p.selecting {
+        return;
+    }
+    let start = |kind| {
+        response
+            .interact_pointer_pos()
+            .map(|pos| Selection::new(kind, m.point_at(pos, p.offset), Side::Left))
+    };
     if response.drag_started()
-        && selecting
-        && let Some(pos) = response.interact_pointer_pos()
+        && let Some(selection) = start(SelectionType::Simple)
     {
-        lock(&s.term).selection = Some(Selection::new(
-            SelectionType::Simple,
-            point_at(pos, offset),
-            Side::Left,
-        ));
+        lock(&s.term).selection = Some(selection);
     }
     if response.dragged()
-        && selecting
         && let Some(pos) = response.interact_pointer_pos()
         && let Some(selection) = &mut lock(&s.term).selection
     {
-        selection.update(point_at(pos, offset), Side::Right);
+        selection.update(m.point_at(pos, p.offset), Side::Right);
     }
     if response.double_clicked()
-        && selecting
-        && let Some(pos) = response.interact_pointer_pos()
+        && let Some(selection) = start(SelectionType::Semantic)
     {
-        lock(&s.term).selection = Some(Selection::new(
-            SelectionType::Semantic,
-            point_at(pos, offset),
-            Side::Left,
-        ));
+        lock(&s.term).selection = Some(selection);
     }
+}
+
+/// Takes keyboard focus when the pane is the active one, and keeps Tab, arrows and
+/// Escape for the terminal while it has focus.
+fn manage_focus(ui: &egui::Ui, response: &egui::Response, focused: bool) {
     if focused && !ui.ctx().wants_keyboard_input() {
         response.request_focus();
     }
@@ -826,11 +1112,19 @@ pub fn show(
     if response.clicked() || response.drag_started() {
         response.request_focus();
     }
-    let mut clicked = response.clicked() || response.drag_started();
-    // OSC 8 link text can differ from its target, so always reveal the real URI on
-    // hover before a Ctrl+click opens it.
+}
+
+/// OSC 8 link text can differ from its target, so the real URI is always revealed
+/// on hover before a Ctrl+click opens it. A plain click clears the selection.
+fn handle_links(
+    ui: &egui::Ui,
+    s: &Session,
+    response: &egui::Response,
+    m: &Metrics,
+    p: PointerMode,
+) {
     if let Some(pos) = response.hover_pos() {
-        let uri = lock(&s.term).grid()[point_at(pos, offset)]
+        let uri = lock(&s.term).grid()[m.point_at(pos, p.offset)]
             .hyperlink()
             .map(|link| link.uri().to_string());
         if let Some(uri) = uri {
@@ -846,240 +1140,360 @@ pub fn show(
             response.clone().on_hover_text_at_pointer(tip);
         }
     }
+    let ctrl = ui.input(|i| i.modifiers.ctrl);
     if response.clicked()
-        && ui.input(|i| i.modifiers.ctrl)
+        && ctrl
         && let Some(pos) = response.interact_pointer_pos()
     {
         let term = lock(&s.term);
-        if let Some(link) = term.grid()[point_at(pos, offset)].hyperlink() {
+        if let Some(link) = term.grid()[m.point_at(pos, p.offset)].hyperlink() {
             let url = link.uri();
             if openable_link(url) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
     }
-    if response.clicked() && !ui.input(|i| i.modifiers.ctrl) && selecting {
+    if response.clicked() && !ctrl && p.selecting {
         lock(&s.term).selection = None;
     }
-    if response.hovered() {
-        let delta = ui.input(|i| i.raw_scroll_delta.y);
-        if delta != 0. {
-            if mouse_reporting && !selecting {
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    let p = point_at(pos, 0);
-                    s.write(
-                        format!(
-                            "\x1b[<{};{};{}M",
-                            if delta > 0. { 64 } else { 65 },
-                            p.column.0 + 1,
-                            p.line.0 + 1
-                        )
-                        .into_bytes(),
-                    );
-                }
-            } else {
-                lock(&s.term).scroll_display(Scroll::Delta((delta / 12.).round() as i32));
-            }
-        }
+}
+
+/// Wheel scrolls the scrollback, or is reported to a program that asked for mouse events.
+fn handle_scroll(
+    ui: &egui::Ui,
+    s: &mut Session,
+    response: &egui::Response,
+    m: &Metrics,
+    p: PointerMode,
+) {
+    if !response.hovered() {
+        return;
     }
-    if focused && (response.has_focus() || !ui.ctx().wants_keyboard_input()) {
-        let mode = *lock(&s.term).mode();
-        let events = ui.input(|i| i.events.clone());
-        for event in events {
-            match event {
-                egui::Event::Text(text) => {
-                    if !ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
-                        let text = if ui.input(|i| i.modifiers.alt) {
-                            format!("\x1b{text}")
-                        } else {
-                            text
-                        };
-                        s.write(text.into_bytes());
-                        lock(&s.term).scroll_display(Scroll::Bottom);
-                    }
-                }
-                egui::Event::Copy => {
-                    if ui.input(|i| i.modifiers.shift) {
-                        if let Some(text) = s.selection() {
-                            ui.ctx().copy_text(text);
-                        }
+    let delta = ui.input(|i| i.raw_scroll_delta.y);
+    if delta == 0. {
+        return;
+    }
+    if p.forwards_to_program() {
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            let point = m.point_at(pos, 0);
+            s.write(
+                format!(
+                    "\x1b[<{};{};{}M",
+                    if delta > 0. { 64 } else { 65 },
+                    point.column.0 + 1,
+                    point.line.0 + 1
+                )
+                .into_bytes(),
+            );
+        }
+    } else {
+        lock(&s.term).scroll_display(Scroll::Delta((delta / 12.).round() as i32));
+    }
+}
+
+/// Translates this frame's keyboard, clipboard, IME and mouse-button events into PTY input.
+fn handle_events(
+    ui: &egui::Ui,
+    s: &mut Session,
+    prefs: &Preferences,
+    response: &egui::Response,
+    m: &Metrics,
+    p: PointerMode,
+) {
+    let mode = *lock(&s.term).mode();
+    let events = ui.input(|i| i.events.clone());
+    for event in events {
+        match event {
+            egui::Event::Text(text) => {
+                if !ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                    let text = if ui.input(|i| i.modifiers.alt) {
+                        format!("\x1b{text}")
                     } else {
-                        s.write(vec![3]);
-                    }
-                }
-                egui::Event::Cut => s.write(vec![24]),
-                egui::Event::Paste(text) => s.paste(&text),
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => {
-                    if modifiers.shift
-                        && !modifiers.ctrl
-                        && matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End)
-                    {
-                        lock(&s.term).scroll_display(match key {
-                            Key::PageUp => Scroll::PageUp,
-                            Key::PageDown => Scroll::PageDown,
-                            Key::Home => Scroll::Top,
-                            _ => Scroll::Bottom,
-                        });
-                        continue;
-                    }
-                    if !(modifiers.ctrl && modifiers.shift)
-                        && let Some(bytes) = key_bytes(key, modifiers, mode)
-                    {
-                        s.write(bytes);
-                        lock(&s.term).scroll_display(Scroll::Bottom);
-                    }
-                }
-                egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
-                egui::Event::PointerButton {
-                    pos,
-                    button,
-                    pressed,
-                    ..
-                } if response.hovered() && mouse_reporting && !selecting => {
-                    let p = point_at(pos, 0);
-                    let b = match button {
-                        egui::PointerButton::Primary => 0,
-                        egui::PointerButton::Middle => 1,
-                        _ => 2,
+                        text
                     };
-                    s.write(
-                        format!(
-                            "\x1b[<{b};{};{}{}",
-                            p.column.0 + 1,
-                            p.line.0 + 1,
-                            if pressed { 'M' } else { 'm' }
-                        )
-                        .into_bytes(),
-                    );
+                    s.write(text.into_bytes());
+                    lock(&s.term).scroll_display(Scroll::Bottom);
                 }
-                _ => {}
+            }
+            egui::Event::Copy => {
+                if ui.input(|i| i.modifiers.shift) {
+                    if let Some(text) = s.selection() {
+                        ui.ctx().copy_text(text);
+                    }
+                } else {
+                    s.write(vec![3]);
+                }
+            }
+            egui::Event::Cut => s.write(vec![24]),
+            egui::Event::Paste(text) => {
+                s.paste_or_hold(&text, prefs.confirm_multiline_paste);
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => handle_key(s, key, modifiers, mode),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => s.write(text.into_bytes()),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } if response.hovered() && p.forwards_to_program() => {
+                report_button(s, m.point_at(pos, 0), button, pressed)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Shift+PageUp/PageDown/Home/End scroll the scrollback; other keys go to the PTY.
+fn handle_key(s: &mut Session, key: Key, modifiers: Modifiers, mode: TermMode) {
+    if modifiers.shift
+        && !modifiers.ctrl
+        && matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End)
+    {
+        lock(&s.term).scroll_display(match key {
+            Key::PageUp => Scroll::PageUp,
+            Key::PageDown => Scroll::PageDown,
+            Key::Home => Scroll::Top,
+            _ => Scroll::Bottom,
+        });
+        return;
+    }
+    if !(modifiers.ctrl && modifiers.shift)
+        && let Some(bytes) = key_bytes(key, modifiers, mode)
+    {
+        s.write(bytes);
+        lock(&s.term).scroll_display(Scroll::Bottom);
+    }
+}
+
+/// SGR (1006) mouse button report.
+fn report_button(s: &mut Session, p: Point, button: egui::PointerButton, pressed: bool) {
+    let b = match button {
+        egui::PointerButton::Primary => 0,
+        egui::PointerButton::Middle => 1,
+        _ => 2,
+    };
+    s.write(
+        format!(
+            "\x1b[<{b};{};{}{}",
+            p.column.0 + 1,
+            p.line.0 + 1,
+            if pressed { 'M' } else { 'm' }
+        )
+        .into_bytes(),
+    );
+}
+
+/// Cells (line, column) covered by literal matches of `search` on the visible screen.
+fn search_cells(
+    term: &Term<Events>,
+    size: Size,
+    offset: i32,
+    search: &str,
+) -> std::collections::HashSet<(i32, usize)> {
+    use alacritty_terminal::term::cell::Flags;
+    let mut cells = std::collections::HashSet::new();
+    if search.is_empty() {
+        return cells;
+    }
+    for row in 0..size.rows {
+        let line = Line(row as i32 - offset);
+        let mut text = String::new();
+        let mut positions = Vec::new();
+        for col in 0..size.cols {
+            let point = Point::new(line, Column(col));
+            let cell = &term.grid()[point];
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                positions.push((text.len(), point));
+                text.push(cell.c);
+            }
+        }
+        for (start, found) in text.match_indices(search) {
+            for (byte, point) in &positions {
+                if *byte >= start && *byte < start + found.len() {
+                    cells.insert((point.line.0, point.column.0));
+                }
             }
         }
     }
+    cells
+}
+
+/// Paints every visible cell, search highlights and the cursor.
+#[allow(clippy::too_many_arguments)]
+fn paint_grid(
+    ui: &egui::Ui,
+    s: &Session,
+    theme: &Theme,
+    prefs: &Preferences,
+    painter: &egui::Painter,
+    m: &Metrics,
+    font: &FontId,
+    focused: bool,
+    search: &str,
+) {
     let term = lock(&s.term);
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
     let selection = content.selection;
     let cursor = content.cursor;
-    let mut search_cells = std::collections::HashSet::new();
-    if !search.is_empty() {
-        for row in 0..size.rows {
-            let line = Line(row as i32 - offset);
-            let mut text = String::new();
-            let mut positions = Vec::new();
-            for col in 0..size.cols {
-                let point = Point::new(line, Column(col));
-                let cell = &term.grid()[point];
-                if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    positions.push((text.len(), point));
-                    text.push(cell.c);
-                }
-            }
-            for (start, found) in text.match_indices(search) {
-                for (byte, point) in &positions {
-                    if *byte >= start && *byte < start + found.len() {
-                        search_cells.insert((point.line.0, point.column.0));
-                    }
-                }
-            }
-        }
-    }
-
+    let colors = content.colors;
+    let highlighted = search_cells(&term, m.size, offset, search);
     for cell in content.display_iter {
         let point = cell.point;
         let row = point.line.0 + offset;
-        if row < 0 || row >= s.size.rows as i32 {
+        if row < 0 || row >= m.size.rows as i32 {
             continue;
         }
-        let pos = area.min + Vec2::new(point.column.0 as f32 * cw, row as f32 * ch);
-        let cell_rect = Rect::from_min_size(pos, Vec2::new(cw, ch));
-        let mut fg = resolve_color(cell.fg, theme);
-        let mut bg = resolve_color(cell.bg, theme);
-        let dynamic = |c: Color| {
-            let index = match c {
-                Color::Named(n) => Some(n as usize),
-                Color::Indexed(n) => Some(n as usize),
-                Color::Spec(_) => None,
-            };
-            index
-                .and_then(|i| content.colors[i])
-                .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
-        };
-        fg = dynamic(cell.fg).unwrap_or(fg);
-        bg = dynamic(cell.bg).unwrap_or(bg);
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if selection.is_some_and(|s| s.contains(point)) {
-            bg = theme.term("selectionBackground");
-        }
-        if search_cells.contains(&(point.line.0, point.column.0)) {
-            bg = theme.ui("button");
-        }
-        if bg != theme.term("background") {
-            painter.rect_filled(cell_rect, 0., bg);
-        }
-        if cell
-            .flags
-            .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN)
-        {
-            continue;
-        }
-        if cell.flags.contains(Flags::DIM) {
-            fg = fg.gamma_multiply(0.66);
-        }
-        if cell.c != ' ' {
-            let mut text = cell.c.to_string();
-            if let Some(extra) = cell.zerowidth() {
-                for c in extra {
-                    text.push(*c);
-                }
-            }
-            painter.text(pos, egui::Align2::LEFT_TOP, text, font.clone(), fg);
-        }
-        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-            painter.line_segment(
-                [
-                    Pos2::new(pos.x, pos.y + ch - 2.),
-                    Pos2::new(pos.x + cw, pos.y + ch - 2.),
-                ],
-                Stroke::new(1_f32, fg),
-            );
-        }
+        let selected = selection.is_some_and(|s| s.contains(point));
+        let found = highlighted.contains(&(point.line.0, point.column.0));
+        paint_cell(
+            theme,
+            painter,
+            m,
+            font,
+            colors,
+            &cell,
+            m.cell_pos(point.column.0, row),
+            selected,
+            found,
+        );
     }
-    if focused
+    let show_cursor = focused
         && term.mode().contains(TermMode::SHOW_CURSOR)
         && offset == 0
-        && (!prefs.cursor_blink || ui.input(|i| ((i.time * 2.) as u64).is_multiple_of(2)))
+        && (!prefs.cursor_blink || ui.input(|i| ((i.time * 2.) as u64).is_multiple_of(2)));
+    drop(term);
+    if show_cursor {
+        let r = Rect::from_min_size(
+            m.cell_pos(cursor.point.column.0, cursor.point.line.0),
+            Vec2::new(m.cw, m.ch),
+        );
+        paint_cursor(theme, prefs, painter, r);
+    }
+}
+
+/// Paints one cell's background, glyph (with combining marks) and underline.
+#[allow(clippy::too_many_arguments)]
+fn paint_cell(
+    theme: &Theme,
+    painter: &egui::Painter,
+    m: &Metrics,
+    font: &FontId,
+    colors: &alacritty_terminal::term::color::Colors,
+    cell: &alacritty_terminal::grid::Indexed<&alacritty_terminal::term::cell::Cell>,
+    pos: Pos2,
+    selected: bool,
+    found: bool,
+) {
+    use alacritty_terminal::term::cell::Flags;
+    let (cw, ch) = (m.cw, m.ch);
+    let cell_rect = Rect::from_min_size(pos, Vec2::new(cw, ch));
+    let dynamic = |c: Color| {
+        let index = match c {
+            Color::Named(n) => Some(n as usize),
+            Color::Indexed(n) => Some(n as usize),
+            Color::Spec(_) => None,
+        };
+        index
+            .and_then(|i| colors[i])
+            .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
+    };
+    let mut fg = dynamic(cell.fg).unwrap_or_else(|| resolve_color(cell.fg, theme));
+    let mut bg = dynamic(cell.bg).unwrap_or_else(|| resolve_color(cell.bg, theme));
+    if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if selected {
+        bg = theme.term("selectionBackground");
+    }
+    if found {
+        bg = theme.ui("button");
+    }
+    if bg != theme.term("background") {
+        painter.rect_filled(cell_rect, 0., bg);
+    }
+    if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN)
     {
-        let p = area.min
-            + Vec2::new(
-                cursor.point.column.0 as f32 * cw,
-                cursor.point.line.0 as f32 * ch,
+        return;
+    }
+    if cell.flags.contains(Flags::DIM) {
+        fg = fg.gamma_multiply(0.66);
+    }
+    if cell.c != ' ' {
+        let mut text = cell.c.to_string();
+        if let Some(extra) = cell.zerowidth() {
+            text.extend(extra);
+        }
+        painter.text(pos, egui::Align2::LEFT_TOP, text, font.clone(), fg);
+    }
+    if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+        painter.line_segment(
+            [
+                Pos2::new(pos.x, pos.y + ch - 2.),
+                Pos2::new(pos.x + cw, pos.y + ch - 2.),
+            ],
+            Stroke::new(1_f32, fg),
+        );
+    }
+}
+
+fn paint_cursor(theme: &Theme, prefs: &Preferences, painter: &egui::Painter, r: Rect) {
+    let color = theme.term("cursor");
+    match prefs.cursor_style.as_str() {
+        "bar" => {
+            painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(2_f32, color));
+        }
+        "underline" => {
+            painter.line_segment(
+                [r.left_bottom(), r.right_bottom()],
+                Stroke::new(2_f32, color),
             );
-        let r = Rect::from_min_size(p, Vec2::new(cw, ch));
-        let color = theme.term("cursor");
-        match prefs.cursor_style.as_str() {
-            "bar" => {
-                painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(2_f32, color));
-            }
-            "underline" => {
-                painter.line_segment(
-                    [r.left_bottom(), r.right_bottom()],
-                    Stroke::new(2_f32, color),
-                );
-            }
-            _ => {
-                painter.rect_stroke(r, 0., Stroke::new(1.5_f32, color), egui::StrokeKind::Inside);
-            }
+        }
+        _ => {
+            painter.rect_stroke(r, 0., Stroke::new(1.5_f32, color), egui::StrokeKind::Inside);
         }
     }
-    drop(term);
+}
+
+/// Small "exit N" badge in the corner after a command reported a non-zero status.
+fn paint_exit_badge(
+    s: &Session,
+    theme: &Theme,
+    prefs: &Preferences,
+    painter: &egui::Painter,
+    rect: Rect,
+) {
+    let shell = lock(&s.shell);
+    let Some(code) = shell.last_exit.filter(|c| *c != 0 && !shell.running) else {
+        return;
+    };
+    let galley = painter.layout_no_wrap(
+        format!("exit {code}"),
+        FontId::monospace(prefs.font_size * 0.8),
+        theme.ui("danger"),
+    );
+    let badge = Rect::from_min_size(
+        Pos2::new(rect.right() - galley.size().x - 14., rect.top() + 4.),
+        galley.size() + Vec2::new(10., 4.),
+    );
+    painter.rect_filled(badge, 4., theme.term("background").gamma_multiply(0.85));
+    painter.rect_stroke(
+        badge,
+        4.,
+        Stroke::new(1_f32, theme.ui("danger")),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(badge.min + Vec2::new(5., 2.), galley, theme.ui("danger"));
+}
+
+fn context_menu(s: &mut Session, response: &egui::Response, clicked: &mut bool) {
     response.context_menu(|ui| {
         if ui.button("Copy selection").clicked() {
             if let Some(text) = s.selection() {
@@ -1096,9 +1510,8 @@ pub fn show(
             lock(&s.term).scroll_display(Scroll::Bottom);
             ui.close();
         }
-        clicked = true;
+        *clicked = true;
     });
-    clicked
 }
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -1111,6 +1524,36 @@ mod tests {
     use super::*;
     #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
+    #[test]
+    fn multiline_paste_needs_confirmation_only_without_bracketed_paste() {
+        // Single line, any mode: never asks.
+        assert!(!needs_confirm("ls -la", false, true));
+        assert!(!needs_confirm("ls -la", true, true));
+        // Line breaks of every flavour ask when bracketed paste is off.
+        for text in ["a\nb", "a\r\nb", "a\rb", "rm -rf ~\n"] {
+            assert!(needs_confirm(text, false, true), "{text:?}");
+            // Bracketed-paste programs receive it as text, so no prompt.
+            assert!(!needs_confirm(text, true, true), "{text:?}");
+            // "Don't ask again" turns the prompt off.
+            assert!(!needs_confirm(text, false, false), "{text:?}");
+        }
+        // Decided on the sanitised text: stripped controls are not line breaks.
+        assert!(!needs_confirm("a\x0bb\x0cc\u{85}d", false, true));
+        assert!(!needs_confirm("", false, true));
+    }
+    #[test]
+    fn paste_preview_counts_lines_and_escapes_controls() {
+        assert_eq!(paste_preview("one\ntwo\n"), (2, "one\ntwo".into()));
+        assert_eq!(paste_preview("a\r\nb\rc"), (3, "a\nb\nc".into()));
+        let (n, preview) = paste_preview("x\ty\u{202e}z\n2\n3\n4\n5\n6\n7");
+        assert_eq!(n, 7);
+        let lines: Vec<&str> = preview.lines().collect();
+        assert_eq!(lines.len(), 6, "{preview}");
+        assert_eq!(lines[0], "x\\ty\\u{202e}z");
+        assert_eq!(lines[5], "… 2 more line(s)");
+        let (_, long) = paste_preview(&"a".repeat(500));
+        assert_eq!(long.chars().count(), PREVIEW_LINE_CHARS + 1);
+    }
     #[test]
     fn hyperlink_targets_are_shown_safely() {
         assert!(openable_link("https://example.org"));
@@ -1288,24 +1731,34 @@ mod regressions {
     #[test]
     fn dropping_a_session_does_not_block_the_caller() {
         // Previously kill, reap, the /proc sweep and both thread joins ran here, on
-        // the caller's (UI) thread.
+        // the caller's (UI) thread. Rather than a tight wall-clock bound (a 50ms limit
+        // flaked under CPU load), hold the cleanup thread on a gate and require that
+        // `drop` returns while the child is still unreaped: if any blocking cleanup
+        // (reap or thread join) moved back into `drop`, this deadlocks and the
+        // recv_timeout below fails deterministically, independent of machine load.
         let argv = [
             "/bin/sh".into(),
             "-c".into(),
             "trap '' HUP TERM; while :; do sleep 1; done".into(),
         ];
-        let s =
+        let mut s =
             Session::spawn(&crate::model::home(), Some(&argv), egui::Context::default()).unwrap();
         let pid = s.pid().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        s.cleanup_gate = Some(gate);
         thread::sleep(Duration::from_millis(100));
-        let start = Instant::now();
-        drop(s);
-        let took = start.elapsed();
-        assert!(
-            took < Duration::from_millis(50),
-            "drop blocked for {took:?}"
-        );
-        // The process is still reaped in the background.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(s);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // SAFETY: signal 0 only checks for existence; an unreaped zombie still exists.
+        let unreaped = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        let _ = release.send(());
+        assert!(returned, "drop blocked on the cleanup thread");
+        assert!(unreaped, "drop reaped {pid} before returning");
+        // The process is still reaped in the background once cleanup runs.
         let end = Instant::now() + Duration::from_secs(5);
         // SAFETY: signal 0 only checks for existence.
         while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < end {
