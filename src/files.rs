@@ -64,6 +64,8 @@ impl Document {
         }
         let mut temp =
             tempfile::NamedTempFile::new_in(self.path.parent().context("No parent directory")?)?;
+        #[cfg(unix)]
+        preserve_owner(temp.as_file(), &self.path, &meta)?;
         temp.as_file().set_permissions(meta.permissions())?;
         temp.write_all(self.text.as_bytes())?;
         temp.as_file().sync_all()?;
@@ -72,6 +74,31 @@ impl Document {
         self.original = self.text.clone();
         Ok(())
     }
+}
+/// The replace-by-rename save gives the new file the process's uid/gid. Hand the
+/// temp file the original owner instead; if that is not permitted (e.g. editing
+/// another user's file through group write access), refuse rather than silently
+/// changing who owns the file.
+#[cfg(unix)]
+fn preserve_owner(temp: &fs::File, path: &Path, meta: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    let current = temp.metadata()?;
+    if current.uid() == meta.uid() && current.gid() == meta.gid() {
+        return Ok(());
+    }
+    // SAFETY: fd is a valid open descriptor owned by `temp` for this call.
+    let rc = unsafe { libc::fchown(temp.as_raw_fd(), meta.uid(), meta.gid()) };
+    if rc != 0 {
+        bail!(
+            "Saving {} would change its owner (uid {}, gid {}) to you: {}. Save a copy elsewhere or use an external editor.",
+            path.display(),
+            meta.uid(),
+            meta.gid(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 pub struct Entry {
     pub path: PathBuf,
@@ -137,6 +164,33 @@ mod tests {
         doc.save().unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_to_change_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a");
+        fs::write(&p, "x").unwrap();
+        let mut meta_src = fs::metadata(&p).unwrap();
+        let temp = tempfile::NamedTempFile::new_in(d.path()).unwrap();
+        // Same owner: nothing to do.
+        preserve_owner(temp.as_file(), &p, &meta_src).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            // A file owned by root (uid 0) cannot be handed to us; save must refuse.
+            meta_src = fs::metadata("/").unwrap();
+            assert_eq!(meta_src.uid(), 0);
+            let err = preserve_owner(temp.as_file(), &p, &meta_src).unwrap_err();
+            assert!(err.to_string().contains("change its owner"), "{err}");
+        }
+        let mut doc = Document::open(&p).unwrap();
+        doc.text = "y".into();
+        doc.save().unwrap();
+        assert_eq!(
+            fs::metadata(&p).unwrap().uid(),
+            fs::metadata(d.path()).unwrap().uid()
+        );
     }
 }
 
