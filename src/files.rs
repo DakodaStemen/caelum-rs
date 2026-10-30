@@ -25,16 +25,21 @@ impl Document {
         if bytes.contains(&0) {
             bail!("Binary file; use an external application");
         }
-        let (text, read_only) = match String::from_utf8(bytes.clone()) {
+        let hash = Sha256::digest(&bytes).to_vec();
+        // from_utf8 takes ownership; on failure the bytes come back without a copy.
+        let (text, read_only) = match String::from_utf8(bytes) {
             Ok(t) => (t, false),
-            Err(_) => (bytes.iter().map(|b| char::from(*b)).collect(), true),
+            Err(e) => (
+                e.into_bytes().iter().map(|b| char::from(*b)).collect(),
+                true,
+            ),
         };
         Ok(Self {
             path,
-            text: text.clone(),
-            original: text,
+            original: text.clone(),
+            text,
             read_only,
-            hash: Sha256::digest(&bytes).to_vec(),
+            hash,
         })
     }
     pub fn dirty(&self) -> bool {
@@ -193,6 +198,7 @@ mod tests {
         fs::write(&p, [0xff, 0xe9]).unwrap();
         let mut doc = Document::open(&p).unwrap();
         assert!(doc.read_only);
+        assert_eq!(doc.text, "\u{ff}\u{e9}");
         assert!(doc.save().is_err());
     }
     #[cfg(unix)]
