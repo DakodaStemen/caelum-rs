@@ -49,14 +49,81 @@ enum PendingClose {
     Pane,
     Workspace,
 }
+/// Result of a background directory listing: (path, filter, entries or error).
+type Listing = (
+    PathBuf,
+    String,
+    std::result::Result<Vec<files::Entry>, String>,
+);
 #[derive(Default)]
 struct FileView {
     path_input: String,
+    /// The path `path_input` was last synced from.
+    input_for: Option<PathBuf>,
     filter: String,
     entries: Vec<files::Entry>,
-    loaded: Option<PathBuf>,
+    /// Path and filter of the listing currently shown.
+    loaded: Option<(PathBuf, String)>,
     refreshed: Option<Instant>,
     error: String,
+    /// At most one listing in flight per view.
+    listing: Option<std::sync::mpsc::Receiver<Listing>>,
+}
+impl FileView {
+    /// Applies a finished listing, then starts a new one if the shown listing is for
+    /// another path/filter or older than two seconds. Never blocks on the disk.
+    fn poll(&mut self, path: &Path, ctx: &egui::Context) {
+        if let Some(rx) = &self.listing {
+            match rx.try_recv() {
+                Ok((dir, filter, result)) => {
+                    match result {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.error.clear();
+                        }
+                        Err(e) => self.error = e,
+                    }
+                    self.loaded = Some((dir, filter));
+                    self.refreshed = Some(Instant::now());
+                    self.listing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = "Directory listing stopped unexpectedly".into();
+                    self.refreshed = Some(Instant::now());
+                    self.listing = None;
+                }
+            }
+        }
+        let current = self
+            .loaded
+            .as_ref()
+            .is_some_and(|(p, f)| p == path && *f == self.filter);
+        let stale = self
+            .refreshed
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        if current && !stale {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = path.to_path_buf();
+        let filter = self.filter.clone();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("caelum-files".into())
+            .spawn(move || {
+                let result = files::list(&dir, &filter).map_err(|e| e.to_string());
+                let _ = tx.send((dir, filter, result));
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.listing = Some(rx),
+            Err(e) => {
+                self.error = format!("Cannot list directory: {e}");
+                self.refreshed = Some(Instant::now());
+            }
+        }
+    }
 }
 struct SystemInfo {
     updated: Instant,

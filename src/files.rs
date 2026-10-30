@@ -100,6 +100,7 @@ fn preserve_owner(temp: &fs::File, path: &Path, meta: &fs::Metadata) -> Result<(
     }
     Ok(())
 }
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -112,10 +113,15 @@ pub fn list(path: &Path, filter: &str) -> Result<Vec<Entry>> {
         let item = item?;
         let name = item.file_name().to_string_lossy().into_owned();
         if name.to_lowercase().contains(&filter) {
+            // DirEntry::file_type needs no extra stat on most platforms; only a
+            // symlink is followed to decide whether it points at a directory.
+            let file_type = item.file_type()?;
+            let path = item.path();
+            let directory = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
             entries.push(Entry {
-                path: item.path(),
+                path,
                 name,
-                directory: item.path().is_dir(),
+                directory,
             });
         }
     }
@@ -139,6 +145,46 @@ mod tests {
         fs::write(&p, "external").unwrap();
         assert!(doc.save().is_err());
         assert_eq!(fs::read_to_string(p).unwrap(), "external");
+    }
+    #[test]
+    fn list_sorts_directories_first_and_filters() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("Zeta")).unwrap();
+        fs::write(d.path().join("alpha.txt"), "a").unwrap();
+        fs::write(d.path().join("Beta.rs"), "b").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.path().join("Zeta"), d.path().join("link")).unwrap();
+        let names = |filter: &str| -> Vec<(String, bool)> {
+            list(d.path(), filter)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.directory))
+                .collect()
+        };
+        #[cfg(unix)]
+        assert_eq!(
+            names(""),
+            vec![
+                ("link".into(), true),
+                ("Zeta".into(), true),
+                ("alpha.txt".into(), false),
+                ("Beta.rs".into(), false),
+            ]
+        );
+        assert_eq!(names("BET"), vec![("Beta.rs".into(), false)]);
+        assert!(list(&d.path().join("missing"), "").is_err());
+    }
+    #[test]
+    fn open_reads_utf8_and_hash_matches_save_check() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a");
+        fs::write(&p, "héllo").unwrap();
+        let mut doc = Document::open(&p).unwrap();
+        assert!(!doc.read_only && !doc.dirty());
+        assert_eq!(doc.text, "héllo");
+        doc.text = "bye".into();
+        doc.save().unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "bye");
     }
     #[test]
     fn unknown_encoding_is_read_only() {
