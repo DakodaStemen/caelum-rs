@@ -10,7 +10,7 @@
 | Windows | `.msi` (WiX), `.zip` |
 | macOS | `Caelum_<ver>_universal.dmg` (arm64 + x86_64, verified with `lipo -info`) |
 
-The package/binary name is `caelum-rs` on every platform (deb, rpm, pacman).
+On Linux, the package/binary name is `caelum-rs` across distributions (deb, rpm, pacman). On macOS, the product is `Caelum.app` (inside `Caelum_<ver>_universal.dmg`), and on Windows the executable is `caelum-rs.exe` (distributed in `.msi` and `.zip`).
 
 The workflow has not been exercised on a tag yet; run it via *workflow_dispatch* and check the artifacts before relying on it.
 

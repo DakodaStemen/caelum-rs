@@ -10,7 +10,7 @@
 
 <p align="center"><img src="docs/demo.gif" width="100%" alt="Caelum Rust running shell commands, splitting panes right and below, zooming one, and switching between the Orbit, Aurora, Dawn and Starlight themes"></p>
 
-**A native workspace terminal for Linux.**
+**A native workspace terminal for Linux, macOS and Windows.**
 Caelum uses egui/eframe for the interface, Alacritty's terminal core, and portable-pty
 for real shell sessions. It is a single Rust binary with no browser engine or scripting
 runtime.
@@ -37,9 +37,9 @@ This is an early release: the remaining features are listed in
 
 ## Build and run
 
-Linux is the current target. Install a stable Rust toolchain, a C linker and the
-usual X11/Wayland and OpenGL runtime libraries. Fontconfig is used to locate a
-system monospace font; bundled font fallbacks remain available.
+Caelum targets Linux, macOS (universal DMG) and Windows (MSI + zip). Install a stable
+Rust toolchain, a C linker and the usual OS runtime libraries. On Linux, fontconfig is
+used to locate a system monospace font alongside eframe default fonts.
 
 On Ubuntu, the runtime packages include `libxkbcommon-x11-0`, `libx11-6`,
 `libwayland-client0`, `libegl1`, `libgl1` and `fontconfig`. On Arch, install
