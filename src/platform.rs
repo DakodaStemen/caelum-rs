@@ -82,6 +82,8 @@ pub const FALLBACK_SHELL: &str = "/bin/zsh";
 pub const FALLBACK_SHELL: &str = "/bin/bash";
 #[cfg(windows)]
 pub const FALLBACK_SHELL: &str = "powershell.exe";
+#[cfg(not(any(unix, windows)))]
+compile_error!("caelum-rs supports only unix-like and Windows targets");
 
 /// Pick the shell to launch. On unix `candidate` (normally `$SHELL`) must be an
 /// absolute path to an executable file. On Windows prefer PowerShell 7, then
@@ -105,7 +107,20 @@ pub fn resolve_shell(candidate: Option<&str>) -> String {
     }
     #[cfg(windows)]
     {
-        let _ = candidate;
+        // Honour an explicit candidate (absolute path, or a bare name found on PATH).
+        if let Some(c) = candidate.filter(|c| !c.is_empty()) {
+            let p = Path::new(c);
+            let exists = if p.is_absolute() || p.components().count() > 1 {
+                p.is_file()
+            } else {
+                std::env::var_os("PATH")
+                    .map(|v| std::env::split_paths(&v).any(|d| d.join(c).is_file()))
+                    .unwrap_or(false)
+            };
+            if exists {
+                return c.to_string();
+            }
+        }
         let on_path = |exe: &str| {
             std::env::var_os("PATH")
                 .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
@@ -137,18 +152,28 @@ pub fn shell_args(shell: &str) -> &'static [&'static str] {
 /// A deterministic interactive shell command for automated validation.
 pub fn test_shell_command() -> Vec<String> {
     #[cfg(unix)]
-    let argv: &[&str] = &[
-        "/usr/bin/env",
-        "HISTFILE=/dev/null",
-        "PS1=$ ",
-        "/bin/bash",
-        "--noprofile",
-        "--norc",
-        "-i",
-    ];
+    {
+        // Prefer bash (absent from /bin on some systems); fall back to the platform shell.
+        let shell = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .unwrap_or(FALLBACK_SHELL);
+        let mut argv: Vec<String> = ["/usr/bin/env", "HISTFILE=/dev/null", "PS1=$ ", shell]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if shell.ends_with("bash") {
+            argv.extend(["--noprofile", "--norc"].map(String::from));
+        } else {
+            argv.push("-f".into()); // zsh: skip startup files
+        }
+        argv.push("-i".into());
+        argv
+    }
     #[cfg(windows)]
-    let argv: &[&str] = &["cmd.exe", "/Q"];
-    argv.iter().map(|s| s.to_string()).collect()
+    {
+        vec!["cmd.exe".to_string(), "/Q".to_string()]
+    }
 }
 
 /// Current working directory of process `pid`, where the OS exposes it cheaply.
@@ -159,8 +184,15 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        None
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let pid = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        );
+        sys.process(pid)?.cwd().map(Path::to_path_buf)
     }
 }
 
@@ -339,10 +371,48 @@ pub fn kill_process_tree(pid: u32, master: &dyn portable_pty::MasterPty) {
             libc::kill(member, libc::SIGKILL);
         }
     }
+    // No /proc session scan here: walk the parent-pid tree instead.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    for member in descendants(&process_parents(), pid) {
+        // SAFETY: kill has no memory-safety preconditions; we only target our descendants.
+        unsafe {
+            libc::kill(member as i32, libc::SIGKILL);
+        }
+    }
     #[cfg(not(unix))]
     {
         let _ = (pid, master);
     }
+}
+
+/// (pid, parent pid) for every visible process.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_parents() -> Vec<(u32, u32)> {
+    use sysinfo::{ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.processes()
+        .iter()
+        .filter_map(|(pid, p)| Some((pid.as_u32(), p.parent()?.as_u32())))
+        .collect()
+}
+
+/// All transitive children of `root` (excluding `root`) given (pid, parent) pairs.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn descendants(pairs: &[(u32, u32)], root: u32) -> Vec<u32> {
+    let mut found = vec![root];
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i];
+        for &(pid, ppid) in pairs {
+            if ppid == parent && pid != parent && !found.contains(&pid) {
+                found.push(pid);
+            }
+        }
+        i += 1;
+    }
+    found.remove(0);
+    found
 }
 
 /// Parses the session id (field 6) from a `/proc/<pid>/stat` line. The command
@@ -446,6 +516,28 @@ mod tests {
         unsafe { libc::kill(-sid, libc::SIGKILL) };
         let _ = child.wait();
         assert!(gone, "background job {job} survived");
+    }
+    #[test]
+    fn descendants_walks_tree_and_survives_cycles() {
+        let pairs = [(2, 1), (3, 2), (4, 2), (5, 9), (1, 3)];
+        let mut d = descendants(&pairs, 2);
+        d.sort();
+        assert_eq!(d, vec![1, 3, 4]);
+        assert!(descendants(&pairs, 5).is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn test_shell_command_uses_existing_shell() {
+        let argv = test_shell_command();
+        assert!(Path::new(&argv[3]).is_file(), "{argv:?}");
+    }
+    #[test]
+    fn process_cwd_of_self_matches_current_dir() {
+        let got = process_cwd(std::process::id()).map(|p| p.canonicalize().unwrap());
+        assert_eq!(
+            got,
+            Some(std::env::current_dir().unwrap().canonicalize().unwrap())
+        );
     }
     #[test]
     fn instance_lock_is_exclusive() {

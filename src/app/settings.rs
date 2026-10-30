@@ -238,13 +238,19 @@ impl App {
     }
 }
 
-/// Resolves a font family through fontconfig and returns its bytes if egui can parse them.
+/// Resolves a font family (fontconfig first, then standard font directories) and
+/// returns its bytes if egui can parse them.
 fn resolve_font(name: &str) -> Option<Vec<u8>> {
     // A leading '-' would be parsed by fc-match as an option, not a font pattern.
     if name.starts_with('-') {
         return None;
     }
-    let output = std::process::Command::new("fc-match")
+    let parse = |bytes: Vec<u8>| {
+        ab_glyph::FontArc::try_from_vec(bytes.clone())
+            .ok()
+            .map(|_| bytes)
+    };
+    if let Ok(output) = std::process::Command::new("fc-match")
         .args([
             "-f",
             "%{file}",
@@ -252,12 +258,100 @@ fn resolve_font(name: &str) -> Option<Vec<u8>> {
             if name.is_empty() { "monospace" } else { name },
         ])
         .output()
-        .ok()?;
-    if !output.status.success() {
+        && output.status.success()
+        && let Some(bytes) = fs::read(String::from_utf8_lossy(&output.stdout).trim())
+            .ok()
+            .and_then(parse)
+    {
+        return Some(bytes);
+    }
+    // macOS/Windows (or Linux without fontconfig): scan the standard font directories.
+    let wanted: Vec<&str> = if name.is_empty() {
+        vec!["Menlo", "Consolas", "Courier New", "DejaVuSansMono"]
+    } else {
+        vec![name]
+    };
+    let dirs = font_dirs();
+    wanted.into_iter().find_map(|n| {
+        find_font_file(&dirs, n)
+            .and_then(|p| fs::read(p).ok())
+            .and_then(parse)
+    })
+}
+
+fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/System/Library/Fonts"),
+        PathBuf::from("/Library/Fonts"),
+        caelum_rs::platform::home().join("Library/Fonts"),
+    ];
+    if let Some(w) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
+        dirs.push(PathBuf::from(w).join("Fonts"));
+    }
+    if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(l).join("Microsoft/Windows/Fonts"));
+    }
+    dirs
+}
+
+/// Finds a font file whose name matches `family` (case, spaces and dashes ignored):
+/// an exact stem match wins, otherwise the shortest stem starting with the family.
+fn find_font_file(dirs: &[PathBuf], family: &str) -> Option<PathBuf> {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let want = norm(family);
+    if want.is_empty() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout);
-    let bytes = fs::read(path.trim()).ok()?;
-    ab_glyph::FontArc::try_from_vec(bytes.clone()).ok()?;
-    Some(bytes)
+    let mut best: Option<(usize, PathBuf)> = None;
+    let mut stack: Vec<(PathBuf, u8)> = dirs.iter().cloned().map(|d| (d, 0)).collect();
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if depth < 2 {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(str::to_lowercase);
+            if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc")) {
+                continue;
+            }
+            let stem = norm(path.file_stem().and_then(|x| x.to_str()).unwrap_or(""));
+            if stem == want {
+                return Some(path);
+            }
+            if stem.starts_with(&want) && best.as_ref().is_none_or(|(l, _)| stem.len() < *l) {
+                best = Some((stem.len(), path));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    #[test]
+    fn finds_font_by_family_name() {
+        let d = tempfile::tempdir().unwrap();
+        let sub = d.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("Menlo-Bold.ttf"), b"x").unwrap();
+        fs::write(sub.join("Menlo.ttc"), b"x").unwrap();
+        fs::write(d.path().join("notes.txt"), b"x").unwrap();
+        let dirs = [d.path().to_path_buf()];
+        assert_eq!(find_font_file(&dirs, "menlo"), Some(sub.join("Menlo.ttc")));
+        assert_eq!(find_font_file(&dirs, "Nope"), None);
+        assert_eq!(find_font_file(&dirs, ""), None);
+    }
 }
