@@ -23,14 +23,82 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+/// Terminal events forwarded from the parser thread to the UI thread.
+///
+/// The queue is bounded so a session whose pane is not being drawn (and therefore
+/// not polled) cannot grow memory without limit. Title changes are coalesced into
+/// a single latest-value slot, so a program spamming OSC 0/2 costs O(1) memory and
+/// the UI only ever sees the newest title. Only events the UI acts on are queued;
+/// if the queue is full, further replies are dropped rather than blocking the
+/// parser (alacritty's `EventListener::send_event` must not block).
 #[derive(Clone)]
 pub struct Events {
-    tx: mpsc::Sender<Event>,
+    tx: SyncSender<Event>,
+    title: Arc<Mutex<Option<String>>>,
+}
+/// UI-side end of [`Events`].
+struct EventQueue {
+    rx: Receiver<Event>,
+    title: Arc<Mutex<Option<String>>>,
+}
+const EVENT_QUEUE: usize = 1024;
+impl Events {
+    fn new() -> (Self, EventQueue) {
+        let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE);
+        let title = Arc::new(Mutex::new(None));
+        (
+            Self {
+                tx,
+                title: title.clone(),
+            },
+            EventQueue { rx, title },
+        )
+    }
 }
 impl EventListener for Events {
     fn send_event(&self, event: Event) {
-        let _ = self.tx.send(event);
+        match event {
+            Event::Title(title) => *lock(&self.title) = Some(sanitize_title(&title)),
+            Event::ResetTitle => *lock(&self.title) = Some(DEFAULT_TITLE.into()),
+            Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) => {
+                let _ = self.tx.try_send(event);
+            }
+            // Everything else (wakeups, bells, clipboard requests, ...) is ignored by the UI.
+            _ => {}
+        }
     }
+}
+const DEFAULT_TITLE: &str = "Terminal";
+const MAX_TITLE_CHARS: usize = 100;
+/// Bidirectional formatting characters that can visually reorder surrounding text.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+/// Makes a program-supplied window title safe to show in tabs and window chrome:
+/// drops C0/C1 controls and DEL plus bidi overrides/isolates, trims, and caps length.
+fn sanitize_title(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|&c| !c.is_control() && !is_bidi_control(c))
+        .collect();
+    let clean: String = clean.trim().chars().take(MAX_TITLE_CHARS).collect();
+    let clean = clean.trim_end();
+    if clean.is_empty() {
+        DEFAULT_TITLE.into()
+    } else {
+        clean.into()
+    }
+}
+/// Removes bytes a paste must never deliver to the PTY: every C0 control except
+/// tab, newline and carriage return (this includes ESC, so a payload cannot end
+/// bracketed paste early or inject sequences), DEL, and C1 controls.
+fn sanitize_paste(text: &str) -> String {
+    text.chars()
+        .filter(|&c| matches!(c, '\t' | '\n' | '\r') || !c.is_control())
+        .collect()
 }
 #[derive(Clone, Copy)]
 pub struct Size {
@@ -54,10 +122,11 @@ pub struct Session {
     pub cwd: PathBuf,
     pub exited: bool,
     pub error: Option<String>,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    // `Option` only so `Drop` can hand them to the cleanup thread; always `Some` while alive.
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     input: Option<SyncSender<Vec<u8>>>,
-    events: Receiver<Event>,
+    events: EventQueue,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     size: Size,
@@ -106,16 +175,26 @@ impl Session {
                 }
             }
         }
+        // The reader thread waits for readiness with poll(2) on its own duplicate of the
+        // master descriptor, so it never outlives the fd it polls.
+        #[cfg(unix)]
+        let poll_fd = {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            let fd = pair.master.as_raw_fd().context("PTY has no descriptor")?;
+            // SAFETY: fd is a live descriptor; dup returns a new one we exclusively own.
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                bail!("Cannot duplicate PTY descriptor");
+            }
+            // SAFETY: dup is a freshly created, valid descriptor owned by nobody else.
+            unsafe { OwnedFd::from_raw_fd(dup) }
+        };
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
-        let (tx, events) = mpsc::channel();
-        let term = Arc::new(Mutex::new(Term::new(
-            Config::default(),
-            &size,
-            Events { tx },
-        )));
+        let (listener, events) = Events::new();
+        let term = Arc::new(Mutex::new(Term::new(Config::default(), &size, listener)));
         let stop = Arc::new(AtomicBool::new(false));
         let read_stop = stop.clone();
         let read_term = term.clone();
@@ -134,7 +213,10 @@ impl Session {
                         read_ctx.request_repaint();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(8))
+                        #[cfg(unix)]
+                        wait_readable(&poll_fd, READ_IDLE_WAIT);
+                        #[cfg(not(unix))]
+                        thread::sleep(READ_IDLE_WAIT);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
@@ -171,8 +253,8 @@ impl Session {
             cwd,
             exited: false,
             error: None,
-            master: pair.master,
-            child,
+            master: Some(pair.master),
+            child: Some(child),
             input: Some(input),
             events,
             stop,
@@ -215,19 +297,15 @@ impl Session {
     }
     pub fn paste(&mut self, text: &str) {
         let bracketed = lock(&self.term).mode().contains(TermMode::BRACKETED_PASTE);
-        let text = text.replace('\x1b', "");
-        let bytes = if bracketed {
-            format!("\x1b[200~{text}\x1b[201~").into_bytes()
-        } else {
-            text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
-        };
-        self.write(bytes);
+        self.write(paste_bytes(text, bracketed));
     }
     pub fn poll(&mut self, theme: &Theme) {
         self.flush_input();
-        while let Ok(event) = self.events.try_recv() {
+        if let Some(title) = lock(&self.events.title).take() {
+            self.title = title;
+        }
+        while let Ok(event) = self.events.rx.try_recv() {
             match event {
-                Event::Title(title) => self.title = title,
                 Event::PtyWrite(text) => self.write(text.into_bytes()),
                 Event::ColorRequest(i, format) => {
                     let c = index_color(i, theme);
@@ -253,14 +331,16 @@ impl Session {
                 _ => {}
             }
         }
-        if !self.exited {
-            match self.child.try_wait() {
+        if !self.exited
+            && let Some(child) = &mut self.child
+        {
+            match child.try_wait() {
                 Ok(Some(_)) => self.exited = true,
                 Ok(None) => {}
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
-        if let Some(pid) = self.child.process_id()
+        if let Some(pid) = self.pid()
             && !self.exited
             && let Some(cwd) = crate::platform::process_cwd(pid)
         {
@@ -275,7 +355,8 @@ impl Session {
         if self.size.cols == size.cols && self.size.rows == size.rows {
             return;
         }
-        if let Err(e) = self.master.resize(PtySize {
+        let Some(master) = &self.master else { return };
+        if let Err(e) = master.resize(PtySize {
             rows: size.rows as u16,
             cols: size.cols as u16,
             pixel_width: 0,
@@ -380,22 +461,92 @@ impl Session {
         lock(&self.term).selection_to_string()
     }
     pub fn pid(&self) -> Option<u32> {
-        self.child.process_id()
+        self.child.as_ref()?.process_id()
+    }
+}
+/// Longest the reader sleeps between checks of the stop flag while the PTY is idle.
+const READ_IDLE_WAIT: Duration = if cfg!(unix) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_millis(25)
+};
+/// Blocks until `fd` is readable, hung up, or `timeout` elapses, so an idle
+/// session costs no CPU while staying responsive to its stop flag.
+#[cfg(unix)]
+fn wait_readable(fd: &std::os::fd::OwnedFd, timeout: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pfd is a valid pollfd for a descriptor we own for the whole call.
+    // EINTR and errors simply return; the caller retries the read.
+    unsafe {
+        libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int);
+    }
+}
+/// Bytes sent to the PTY for a paste, after sanitising and optional bracketing.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = sanitize_paste(text);
+    if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
     }
 }
 impl Drop for Session {
+    /// Closing a pane must never stall the UI: sweeping the session's process tree
+    /// (a `/proc` scan on Linux), reaping the child and joining the I/O threads
+    /// (each can sit in a poll/recv timeout) all happen on a detached cleanup thread.
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None))
-            && let Some(pid) = self.child.process_id()
-        {
-            crate::platform::kill_process_tree(pid, &*self.master);
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         self.stop.store(true, Ordering::Relaxed);
         self.input.take();
-        for t in self.threads.drain(..) {
-            let _ = t.join();
+        let (Some(mut child), Some(master)) = (self.child.take(), self.master.take()) else {
+            return;
+        };
+        let threads = std::mem::take(&mut self.threads);
+        // Decide liveness before any signal so the cleanup thread never reaps the
+        // child before it has walked the child's session.
+        let running = matches!(child.try_wait(), Ok(None));
+        // Signal the foreground job and the shell's process group right away (a few
+        // non-blocking syscalls) so they die even if the app exits before the cleanup
+        // thread runs. The thread then also sweeps background jobs in the session.
+        #[cfg(unix)]
+        if running && let Some(pid) = child.process_id() {
+            let pid = pid as libc::pid_t;
+            // SAFETY: getsid/kill have no memory-safety preconditions. The child is
+            // unreaped, so its pid (a session and group leader created by portable-pty)
+            // is still ours, and the foreground group is only signalled if it belongs
+            // to that session.
+            unsafe {
+                if let Some(fg) = master.process_group_leader()
+                    && fg > 0
+                    && libc::getsid(fg) == pid
+                {
+                    libc::kill(-fg, libc::SIGKILL);
+                }
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let cleanup = move || {
+            if running && let Some(pid) = child.process_id() {
+                crate::platform::kill_process_tree(pid, &*master);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            for t in threads {
+                let _ = t.join();
+            }
+            drop(master);
+        };
+        if let Err(e) = thread::Builder::new()
+            .name("caelum-pty-cleanup".into())
+            .spawn(cleanup)
+        {
+            // Out of threads: the closure (and the child) was dropped unrun. Nothing
+            // more can be done without blocking the UI; record it for diagnosis.
+            eprintln!("caelum: could not spawn PTY cleanup thread: {e}");
         }
     }
 }
@@ -1022,12 +1173,8 @@ mod regressions {
     use std::time::Instant;
     #[test]
     fn parser_preserves_truecolor_wide_cells_and_alternate_screen() {
-        let (tx, _) = mpsc::channel();
-        let mut term = Term::new(
-            Config::default(),
-            &Size { cols: 20, rows: 5 },
-            Events { tx },
-        );
+        let (events, _queue) = Events::new();
+        let mut term = Term::new(Config::default(), &Size { cols: 20, rows: 5 }, events);
         let mut parser: ansi::Processor = ansi::Processor::new();
         parser.advance(&mut term, "\x1b[38;2;12;34;56m界\x1b[0m".as_bytes());
         let cell = &term.grid()[Point::new(Line(0), Column(0))];
@@ -1100,17 +1247,134 @@ mod regressions {
         }
         assert!(!children.is_empty());
         drop(s);
-        for child in children {
+        // Cleanup runs on a background thread, so give it a moment to finish.
+        let gone = |child: &u32| {
             let status =
                 std::fs::read_to_string(format!("/proc/{child}/status")).unwrap_or_default();
-            assert!(
-                status.is_empty()
-                    || status
-                        .lines()
-                        .any(|l| l.starts_with("State:") && l.contains('Z')),
-                "child {child} is still running"
-            );
+            status.is_empty()
+                || status
+                    .lines()
+                    .any(|l| l.starts_with("State:") && l.contains('Z'))
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while !children.iter().all(gone) && Instant::now() < end {
+            thread::sleep(Duration::from_millis(10));
         }
+        for child in children {
+            assert!(gone(&child), "child {child} is still running");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_session_does_not_block_the_caller() {
+        // Previously kill, reap, the /proc sweep and both thread joins ran here, on
+        // the caller's (UI) thread.
+        let argv = [
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' HUP TERM; while :; do sleep 1; done".into(),
+        ];
+        let s =
+            Session::spawn(&crate::model::home(), Some(&argv), egui::Context::default()).unwrap();
+        let pid = s.pid().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        drop(s);
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_millis(50),
+            "drop blocked for {took:?}"
+        );
+        // The process is still reaped in the background.
+        let end = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks for existence.
+        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < end {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "{pid} survived"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn idle_wait_blocks_until_data_or_timeout() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills two fresh descriptors that we take ownership of below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned by nobody else.
+        let (r, mut w) = unsafe {
+            (
+                OwnedFd::from_raw_fd(fds[0]),
+                std::fs::File::from(OwnedFd::from_raw_fd(fds[1])),
+            )
+        };
+        // Idle: the reader sleeps in the kernel for the whole timeout, no spinning.
+        let start = Instant::now();
+        wait_readable(&r, Duration::from_millis(100));
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "{:?}",
+            start.elapsed()
+        );
+        // Data available: it wakes immediately.
+        w.write_all(b"x").unwrap();
+        let start = Instant::now();
+        wait_readable(&r, Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+    #[test]
+    fn titles_are_sanitised() {
+        assert_eq!(sanitize_title("vim ~/notes"), "vim ~/notes");
+        assert_eq!(
+            sanitize_title("a\x07b\x1b[31mc\u{9b}d\x7fe\nf\tg"),
+            "ab[31mcdefg"
+        );
+        assert_eq!(
+            sanitize_title("safe\u{202e}txt.exe\u{2066}\u{2069}\u{200e}\u{200f}\u{61c}\u{202a}"),
+            "safetxt.exe"
+        );
+        let long = sanitize_title(&"é".repeat(500));
+        assert_eq!(long.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(sanitize_title(" \x1b\u{202e} "), DEFAULT_TITLE);
+    }
+    #[test]
+    fn title_events_are_coalesced_and_sanitised() {
+        let (events, queue) = Events::new();
+        for i in 0..10_000 {
+            events.send_event(Event::Title(format!("t{i}\u{202e}\x07")));
+        }
+        events.send_event(Event::Wakeup);
+        assert_eq!(lock(&queue.title).take().as_deref(), Some("t9999"));
+        assert!(
+            queue.rx.try_recv().is_err(),
+            "titles and wakeups are not queued"
+        );
+        // Replies are bounded rather than unbounded when the UI is not polling.
+        for _ in 0..EVENT_QUEUE * 3 {
+            events.send_event(Event::PtyWrite("x".into()));
+        }
+        assert_eq!(queue.rx.try_iter().count(), EVENT_QUEUE);
+    }
+    #[test]
+    fn paste_strips_controls_but_keeps_text_layout() {
+        let payload = "echo hi\x1b[201~\x03\x04\x7f\u{9b}31m\x00\tok\r\nnext\n";
+        assert_eq!(sanitize_paste(payload), "echo hi[201~31m\tok\r\nnext\n");
+        assert_eq!(
+            paste_bytes(payload, false),
+            b"echo hi[201~31m\tok\rnext\r".to_vec()
+        );
+        assert_eq!(
+            paste_bytes(payload, true),
+            b"\x1b[200~echo hi[201~31m\tok\r\nnext\n\x1b[201~".to_vec()
+        );
+        assert_eq!(sanitize_paste("naïve 界 😀"), "naïve 界 😀");
     }
 }
 
