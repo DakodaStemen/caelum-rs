@@ -3,7 +3,7 @@ name = "caelum-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Caelum: a native workspace terminal for Linux, built in Rust. Your space to build."
+description = "Caelum: a native workspace terminal for Linux, macOS and Windows, built in Rust. Your space to build."
 license = "MIT"
 repository = "https://github.com/DakodaStemen/caelum-rs"
 
@@ -11,8 +11,8 @@ repository = "https://github.com/DakodaStemen/caelum-rs"
 alacritty_terminal = "=0.26.0"
 anyhow = "1"
 ab_glyph = "0.2"
-eframe = { version = "0.33", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "accesskit"] }
-libc = "0.2"
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -25,9 +25,48 @@ uuid = { version = "1", features = ["v4", "serde"] }
 toml = "0.9"
 notify = "8"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux needs explicit windowing backends; Windows (Win32) and macOS (AppKit) use winit's defaults.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["x11", "wayland"] }
+
+# Non-Linux hosts have no /proc, so the system panel uses sysinfo there.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 x11rb = { version = "0.14", features = ["xtest"] }
 
 [profile.release]
 lto = "thin"
 strip = true
+
+# Packaging via cargo-packager (https://github.com/crabnebula-dev/cargo-packager).
+# Release artifacts are built by .github/workflows/release.yml. RPMs use the
+# [package.metadata.generate-rpm] table below since cargo-packager has no rpm target.
+[package.metadata.packager]
+product-name = "Caelum"
+identifier = "io.github.DakodaStemen.CaelumRust"
+description = "A native workspace terminal built in Rust."
+authors = ["DakodaStemen"]
+license-file = "LICENSE"
+category = "DeveloperTool"
+icons = ["assets/brand/icon.png"]
+formats = ["all"]
+
+[package.metadata.packager.deb]
+package-name = "caelum-rs"
+
+[package.metadata.packager.wix]
+# MSI: unsigned unless a signing certificate is configured (see PACKAGING.md).
+
+[package.metadata.packager.dmg]
+window-size = { width = 660, height = 400 }
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/caelum-rs", dest = "/usr/bin/caelum-rs", mode = "755" },
+  { source = "LICENSE", dest = "/usr/share/licenses/caelum-rs/LICENSE", mode = "644", doc = true },
+]

@@ -49,31 +49,16 @@ fn main() -> Result<()> {
         None
     };
     caelum_rs::model::create_private_dir(&profile, true)?;
+    // Never load workspace/drafts another user could have written: they can launch commands.
+    caelum_rs::model::check_profile_trust(&profile)?;
     // A process-held lock prevents two windows from racing workspace writes.
-    #[cfg(unix)]
-    let _lock = {
-        use std::os::fd::AsRawFd;
-        let f = {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .open(profile.join("app.lock"))?;
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-            f
-        };
-        // SAFETY: the descriptor remains owned by f for the lifetime of the application.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            bail!(
+    let _lock =
+        caelum_rs::platform::lock_instance(&profile.join("app.lock"))?.with_context(|| {
+            format!(
                 "Caelum Rust is already using {}. Open another profile with --data-dir.",
                 profile.display()
-            );
-        }
-        f
-    };
+            )
+        })?;
     if let Some(source) = import {
         State::import_legacy(&source, &profile.join("workspace.json"))?;
     }
@@ -92,6 +77,9 @@ fn main() -> Result<()> {
     } else {
         State::default()
     };
+    if let Some(first) = state.warnings.first() {
+        message = first.clone();
+    }
     if smoke.is_some() {
         message = "Desktop validation · isolated profile".into();
     }

@@ -175,7 +175,10 @@ impl App {
             {
                 ui.colored_label(theme.syn("number"), "● unsaved");
             }
-            ui.label(RichText::new(kind).size(10.).color(theme.ui("muted")));
+            let roomy = ui.available_width() > 190.;
+            if roomy {
+                ui.label(RichText::new(kind).size(10.).color(theme.ui("muted")));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new("×").frame(false).small())
@@ -185,10 +188,11 @@ impl App {
                     self.focused = id.to_string();
                     self.pending = Some(PendingClose::Pane);
                 }
-                if ui
-                    .add(egui::Button::new("Zoom").frame(false).small())
-                    .on_hover_text("Zoom or restore (Ctrl+Shift+Enter)")
-                    .clicked()
+                if roomy
+                    && ui
+                        .add(egui::Button::new("Zoom").frame(false).small())
+                        .on_hover_text("Zoom or restore (Ctrl+Shift+Enter)")
+                        .clicked()
                 {
                     self.focused = id.to_string();
                     self.zoom = if self.zoom.is_some() {

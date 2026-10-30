@@ -101,7 +101,7 @@ impl Theme {
         v.extreme_bg_color = self.ui("background");
         v.selection.bg_fill = self.ui("button");
         v.selection.stroke.color = self.ui("textStrong");
-        v.widgets.inactive.bg_fill = self.ui("surface");
+        v.widgets.inactive.bg_fill = self.ui("borderStrong");
         v.widgets.inactive.weak_bg_fill = self.ui("surface");
         v.widgets.inactive.bg_stroke.color = self.ui("border");
         v.widgets.hovered.bg_fill = self.ui("tabActive");
@@ -141,6 +141,8 @@ impl Theme {
             st.spacing.button_padding = Vec2::new(11., 6.);
             st.spacing.interact_size.y = 28.;
             st.spacing.scroll.bar_width = 8.;
+            st.spacing.slider_width = 180.;
+            st.spacing.slider_rail_height = 6.;
         });
     }
 }

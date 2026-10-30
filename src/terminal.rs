@@ -12,6 +12,7 @@ use alacritty_terminal::{
     term::{Config, Term, TermMode},
     vte::ansi::{self, Color, NamedColor},
 };
+#[cfg_attr(not(unix), allow(unused_imports))]
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
@@ -131,15 +132,15 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let shell = resolve_shell(std::env::var("SHELL").ok().as_deref());
+        let shell = crate::platform::resolve_shell(std::env::var("SHELL").ok().as_deref());
         let mut cmd = if let Some(argv) = argv {
             let first = argv.first().context("Empty terminal command")?;
             let mut c = CommandBuilder::new(first);
             c.args(&argv[1..]);
             c
         } else {
-            let mut c = CommandBuilder::new(shell);
-            c.arg("-l");
+            let mut c = CommandBuilder::new(&shell);
+            c.args(crate::platform::shell_args(&shell));
             c
         };
         cmd.cwd(&cwd);
@@ -327,19 +328,16 @@ impl Session {
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
-        // A shell-reported OSC 7 directory wins; /proc is the fallback for shells
-        // without integration (it only sees the process we spawned, not subshells).
+        // A shell-reported OSC 7 directory wins; the platform lookup is the fallback
+        // for shells without integration (it only sees the process we spawned, not subshells).
         let reported = lock(&self.shell).cwd.clone().filter(|p| p.is_dir());
         if let Some(cwd) = reported {
             self.cwd = cwd;
-        } else {
-            #[cfg(target_os = "linux")]
-            if let Some(pid) = self.child.process_id()
-                && !self.exited
-                && let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
-            {
-                self.cwd = cwd;
-            }
+        } else if let Some(pid) = self.child.process_id()
+            && !self.exited
+            && let Some(cwd) = crate::platform::process_cwd(pid)
+        {
+            self.cwd = cwd;
         }
     }
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -491,20 +489,10 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        #[cfg(unix)]
         if matches!(self.child.try_wait(), Ok(None))
             && let Some(pid) = self.child.process_id()
         {
-            // SAFETY: portable-pty creates a new session led by this still-owned, unreaped child.
-            unsafe {
-                if let Some(fg) = self.master.process_group_leader()
-                    && fg > 0
-                    && libc::getsid(fg) == pid as i32
-                {
-                    libc::kill(-fg, libc::SIGKILL);
-                }
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+            crate::platform::kill_process_tree(pid, &*self.master);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -654,6 +642,35 @@ pub fn key_bytes(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     };
     Some(seq.into_bytes())
 }
+/// Only web links from OSC 8 hyperlinks are ever opened.
+fn openable_link(uri: &str) -> bool {
+    uri.starts_with("https://") || uri.starts_with("http://")
+}
+
+/// Renders a hyperlink target for a tooltip: control characters are escaped so a
+/// URI cannot hide its real destination behind newlines or bidi tricks, and very
+/// long targets are shortened in the middle.
+fn hover_label(uri: &str) -> String {
+    let clean: String = uri
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                c.escape_unicode().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    let chars: Vec<char> = clean.chars().collect();
+    if chars.len() > 300 {
+        let head: String = chars[..200].iter().collect();
+        let tail: String = chars[chars.len() - 80..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        clean
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     s: &mut Session,
@@ -743,6 +760,25 @@ pub fn show(
         response.request_focus();
     }
     let mut clicked = response.clicked() || response.drag_started();
+    // OSC 8 link text can differ from its target, so always reveal the real URI on
+    // hover before a Ctrl+click opens it.
+    if let Some(pos) = response.hover_pos() {
+        let uri = lock(&s.term).grid()[point_at(pos, offset)]
+            .hyperlink()
+            .map(|link| link.uri().to_string());
+        if let Some(uri) = uri {
+            let tip = if openable_link(&uri) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                format!("{}\nCtrl+click to open", hover_label(&uri))
+            } else {
+                format!(
+                    "{}\n(not opened: only http and https links)",
+                    hover_label(&uri)
+                )
+            };
+            response.clone().on_hover_text_at_pointer(tip);
+        }
+    }
     if response.clicked()
         && ui.input(|i| i.modifiers.ctrl)
         && let Some(pos) = response.interact_pointer_pos()
@@ -750,7 +786,7 @@ pub fn show(
         let term = lock(&s.term);
         if let Some(link) = term.grid()[point_at(pos, offset)].hyperlink() {
             let url = link.uri();
-            if url.starts_with("https://") || url.starts_with("http://") {
+            if openable_link(url) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
@@ -1033,29 +1069,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const DEFAULT_SHELL: &str = "/bin/bash";
-
-/// Pick a usable shell: `candidate` must be an absolute path to an executable file.
-fn resolve_shell(candidate: Option<&str>) -> String {
-    use std::os::unix::fs::PermissionsExt;
-    match candidate {
-        Some(c)
-            if !c.is_empty()
-                && Path::new(c).is_absolute()
-                && std::fs::metadata(c)
-                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false) =>
-        {
-            c.to_string()
-        }
-        _ => DEFAULT_SHELL.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
+    #[test]
+    fn hyperlink_targets_are_shown_safely() {
+        assert!(openable_link("https://example.org"));
+        assert!(!openable_link("file:///etc/passwd"));
+        assert!(!openable_link("javascript:alert(1)"));
+        assert_eq!(hover_label("https://a.example/x"), "https://a.example/x");
+        let tricky = hover_label("https://good.example\nhttps://evil.example\u{202e}");
+        assert!(
+            !tricky.contains('\n') && !tricky.contains('\u{202e}'),
+            "{tricky}"
+        );
+        assert!(tricky.contains("evil.example"));
+        let long = format!("https://x.example/{}", "a".repeat(1000));
+        assert!(hover_label(&long).chars().count() < 300);
+    }
     #[test]
     fn key_modes_and_control() {
         assert_eq!(
@@ -1079,6 +1112,7 @@ mod tests {
             b"\x1b[1;5D"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn real_pty_decodes_colors_resizes_and_accepts_input() {
         let d = tempfile::tempdir().unwrap();
@@ -1101,6 +1135,7 @@ mod tests {
         }
         panic!("{}", s.text());
     }
+    #[cfg(unix)]
     #[test]
     fn missing_cwd_falls_back() {
         let s = Session::spawn(
@@ -1117,6 +1152,7 @@ mod tests {
 mod regressions {
     use super::*;
     use alacritty_terminal::term::cell::Flags;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::time::Instant;
     #[test]
     fn parser_preserves_truecolor_wide_cells_and_alternate_screen() {
@@ -1149,6 +1185,7 @@ mod regressions {
         parser.advance(&mut term, b"\x1b[?1049l");
         assert_eq!(term.grid()[Point::new(Line(0), Column(0))].c, '界');
     }
+    #[cfg(unix)]
     #[test]
     fn literal_search_reaches_history() {
         let argv = [
@@ -1169,6 +1206,7 @@ mod regressions {
         assert!(s.term.lock().unwrap().grid().display_offset() > 0);
         assert_eq!(s.selection().as_deref(), Some("line-5"));
     }
+    #[cfg(target_os = "linux")] // inspects /proc
     #[test]
     fn closing_session_stops_foreground_even_when_hangup_is_ignored() {
         let argv = [
@@ -1210,10 +1248,11 @@ mod regressions {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod input_queue_tests {
     use super::*;
     use std::time::Instant;
+    #[cfg(unix)]
     #[test]
     fn burst_of_small_key_events_is_retained_under_backpressure() {
         let dir = tempfile::tempdir().unwrap();
@@ -1226,7 +1265,7 @@ mod input_queue_tests {
             "--norc".into(),
         ];
         let mut s = Session::spawn(dir.path(), Some(&argv), egui::Context::default()).unwrap();
-        let text = "x".repeat(1000);
+        let text = "x".repeat(if cfg!(target_os = "linux") { 1000 } else { 300 });
         let command = format!("printf '%s' '{text}' > {}\r", file.display());
         for byte in command.bytes() {
             s.write(vec![byte]);
@@ -1262,6 +1301,7 @@ mod lock_shell_tests {
         assert_eq!(*lock(&m), 6);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bad_shell_falls_back() {
         for bad in [
@@ -1272,8 +1312,12 @@ mod lock_shell_tests {
             Some("/nonexistent/shell"),
             Some("/tmp"),
         ] {
-            assert_eq!(resolve_shell(bad), DEFAULT_SHELL, "{bad:?}");
+            assert_eq!(
+                crate::platform::resolve_shell(bad),
+                crate::platform::FALLBACK_SHELL,
+                "{bad:?}"
+            );
         }
-        assert_eq!(resolve_shell(Some("/bin/sh")), "/bin/sh");
+        assert_eq!(crate::platform::resolve_shell(Some("/bin/sh")), "/bin/sh");
     }
 }
