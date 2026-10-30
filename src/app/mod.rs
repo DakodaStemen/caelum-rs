@@ -226,6 +226,7 @@ pub struct App {
     keymap: Keymap,
     config_watch: Option<config::Watcher>,
     writer: model::BackgroundWriter,
+    docio: files::DocumentIo,
 }
 struct Smoke {
     report: PathBuf,
@@ -338,6 +339,10 @@ impl App {
             keymap: Keymap::default(),
             config_watch: None,
             writer: model::BackgroundWriter::new(),
+            docio: {
+                let ctx = cc.egui_ctx.clone();
+                files::DocumentIo::new(move || ctx.request_repaint())
+            },
         };
         if app.smoke.is_none() {
             // Smoke runs use an isolated profile and must not read the user's config.
@@ -787,17 +792,10 @@ impl App {
                     self.pending = None;
                 }
                 if save {
-                    let mut failed = false;
+                    // Saves run on the IO thread; once they land the documents are clean
+                    // and the close completes above. A failed save keeps this dialog open.
                     for id in &dirty {
-                        if let Some(doc) = self.documents.get_mut(id)
-                            && let Err(e) = doc.save()
-                        {
-                            self.message = e.to_string();
-                            failed = true;
-                        }
-                    }
-                    if !failed {
-                        self.finish_close(ctx);
+                        self.save_document(id);
                     }
                 }
                 if discard {
@@ -890,6 +888,7 @@ impl App {
         }
         self.terminals.retain(|id, _| ids.contains(id));
         self.documents.retain(|id, _| ids.contains(id));
+        self.docio.retain(|id| ids.contains(id));
         self.files.retain(|id, _| ids.contains(id));
     }
     fn smoke_tick(&mut self, ctx: &egui::Context) {
@@ -969,20 +968,34 @@ impl App {
                     self.open_file(fixture);
                 }
                 6 => {
+                    let id = self.focused.clone();
+                    if self.docio.loading(&id) {
+                        return Ok(false);
+                    }
                     let doc = self
                         .documents
-                        .get_mut(&self.focused)
+                        .get_mut(&id)
                         .context("Editor was not opened")?;
                     doc.text = "Rust desktop edit\n".into();
-                    doc.save()?;
-                    if fs::read_to_string(&doc.path)? != "Rust desktop edit\n" {
-                        bail!("Editor save failed");
+                    let path = doc.path.clone();
+                    self.save_document(&id);
+                    self.flush_documents();
+                    if fs::read_to_string(&path)? != "Rust desktop edit\n" {
+                        bail!("Editor save failed: {}", self.message);
                     }
-                    fs::write(&doc.path, "external change\n")?;
-                    doc.text = "must refuse".into();
-                    if doc.save().is_ok() {
+                    fs::write(&path, "external change\n")?;
+                    self.documents
+                        .get_mut(&id)
+                        .context("Editor was closed")?
+                        .text = "must refuse".into();
+                    self.save_document(&id);
+                    self.flush_documents();
+                    if fs::read_to_string(&path)? != "external change\n"
+                        || !self.message.contains("changed on disk")
+                    {
                         bail!("External change was overwritten");
                     }
+                    let doc = self.documents.get_mut(&id).context("Editor was closed")?;
                     s.checks.push(
                         "Native editor saves text and refuses external-change overwrite".into(),
                     );
@@ -1073,6 +1086,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingClose::Window);
         }
+        self.poll_documents();
         // The watcher thread reads and parses config.toml; only apply the newest result here.
         if let Some(latest) = self
             .config_watch
@@ -1117,13 +1131,8 @@ impl eframe::App for App {
             self.open_file(path);
         }
         self.overlays(ctx);
-        if let Some(id) = self.pending_save.take()
-            && let Some(doc) = self.documents.get_mut(&id)
-        {
-            self.message = match doc.save() {
-                Ok(()) => "File saved".into(),
-                Err(e) => e.to_string(),
-            };
+        if let Some(id) = self.pending_save.take() {
+            self.save_document(&id);
         }
 
         if self.last_save.elapsed() > Duration::from_secs(3) {
