@@ -96,8 +96,11 @@ impl App {
         self.writer.submit(batch);
         self.last_save = Instant::now();
     }
-    /// Persists and waits until the files are on disk (exit and smoke checks).
+    /// Finishes pending document saves, then persists and waits until the files are
+    /// on disk (exit, window close and smoke checks).
     pub(super) fn persist_now(&mut self) {
+        // Drafts reflect what the saves left dirty, so they are taken afterwards.
+        self.flush_documents();
         self.persist();
         self.writer.flush();
         self.report_write_errors();
