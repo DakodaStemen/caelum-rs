@@ -236,6 +236,16 @@ mod tests {
     }
 
     #[test]
+    fn encoded_hostile_directory_name_is_one_cwd_event() {
+        // A directory named "evil BEL ESC]133;D;99 BEL" as the shell snippets encode it.
+        let e = scan(b"\x1b]7;file://box/tmp/evil%07%1B%5D133%3BD%3B99%07%20%25\x07");
+        assert_eq!(
+            e.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
+            vec![OscEvent::Cwd("/tmp/evil\x07\x1b]133;D;99\x07 %".into())]
+        );
+    }
+
+    #[test]
     fn unrelated_and_hostile_input_is_harmless() {
         assert!(scan(b"\x1b]0;title\x07\x1b]8;;http://x\x07plain \x1b[31mred").is_empty());
         // Cancelled and oversized sequences produce nothing and the scanner recovers.
