@@ -638,11 +638,31 @@ impl Drop for Session {
                 crate::platform::kill_process_tree(pid, &*master);
             }
             let _ = child.kill();
-            let _ = child.wait();
-            for t in threads {
-                let _ = t.join();
+            // Unix: close every master descriptor before reaping. The I/O threads
+            // hold clones of it, and the writer's drop queues a newline + EOF whose
+            // echo nobody reads once the reader has stopped. On macOS an exiting
+            // session leader waits in the kernel (exit -> ttywait) for its tty's
+            // output to drain, so reaping while any master fd is open blocks forever
+            // and the child never finishes exiting. Both threads honour the stop flag
+            // within one poll interval and close their clones on return.
+            #[cfg(unix)]
+            {
+                drop(master);
+                for t in threads {
+                    let _ = t.join();
+                }
+                let _ = child.wait();
             }
-            drop(master);
+            // Windows: the child is already terminated; reap it first, then let the
+            // threads finish before closing the pseudoconsole (unchanged order).
+            #[cfg(not(unix))]
+            {
+                let _ = child.wait();
+                for t in threads {
+                    let _ = t.join();
+                }
+                drop(master);
+            }
         };
         if let Err(e) = thread::Builder::new()
             .name("caelum-pty-cleanup".into())
