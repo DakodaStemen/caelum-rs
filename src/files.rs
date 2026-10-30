@@ -154,8 +154,25 @@ impl Document {
             original_hash: self.hash.clone(),
         }
     }
-    pub fn restore(draft: Draft) -> Result<Self> {
-        let mut doc = Self::open(&draft.path)?;
+    /// Restores a draft only if it targets one of `editor_paths` (the editor panes of
+    /// the loaded workspace). Paths are compared after canonicalization so a draft
+    /// cannot make the app open a file the workspace never had open.
+    pub fn restore(draft: Draft, editor_paths: &[PathBuf]) -> Result<Self> {
+        let target = draft
+            .path
+            .canonicalize()
+            .with_context(|| format!("Recovery target {} is unavailable", draft.path.display()))?;
+        if !editor_paths
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .any(|p| p == target)
+        {
+            bail!(
+                "Skipped recovery for {}: no editor pane in this workspace has it open. The recovery file has been preserved.",
+                draft.path.display()
+            );
+        }
+        let mut doc = Self::open(&target)?;
         if doc.hash != draft.original_hash {
             bail!(
                 "Recovery for {} conflicts with changes on disk. The recovery file has been preserved.",
@@ -178,12 +195,51 @@ mod recovery_tests {
         let mut doc = Document::open(&path).unwrap();
         doc.text = "unsaved".into();
         let draft = doc.draft();
-        let restored = Document::restore(draft).unwrap();
+        let editors = vec![path.clone()];
+        let restored = Document::restore(draft, &editors).unwrap();
         assert_eq!(restored.text, "unsaved");
         assert!(restored.dirty());
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         fs::write(&path, "external edit").unwrap();
-        assert!(Document::restore(doc.draft()).is_err());
+        assert!(Document::restore(doc.draft(), &editors).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "external edit");
+    }
+    #[test]
+    fn draft_for_path_without_editor_pane_is_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let open = d.path().join("open.txt");
+        let secret = d.path().join("secret.txt");
+        fs::write(&open, "a").unwrap();
+        fs::write(&secret, "s").unwrap();
+        // A draft naming a file the workspace never opened, with a matching hash.
+        let draft = Draft {
+            path: secret.clone(),
+            text: "x".into(),
+            original_hash: Sha256::digest(b"s").to_vec(),
+        };
+        let err = Document::restore(draft, std::slice::from_ref(&open))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("Skipped recovery"), "{err}");
+        assert!(
+            Document::restore(
+                Draft {
+                    path: secret,
+                    text: "x".into(),
+                    original_hash: Sha256::digest(b"s").to_vec(),
+                },
+                &[]
+            )
+            .is_err()
+        );
+        // Non-canonical spellings of an open editor path still match.
+        let draft = Draft {
+            path: d.path().join(".").join("open.txt"),
+            text: "b".into(),
+            original_hash: Sha256::digest(b"a").to_vec(),
+        };
+        let editors = vec![d.path().join("sub/../open.txt")];
+        fs::create_dir(d.path().join("sub")).unwrap();
+        assert_eq!(Document::restore(draft, &editors).unwrap().text, "b");
     }
 }
