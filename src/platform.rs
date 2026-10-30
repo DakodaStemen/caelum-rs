@@ -330,10 +330,49 @@ pub fn kill_process_tree(pid: u32, master: &dyn portable_pty::MasterPty) {
         }
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+    // Background jobs run in their own process groups inside the same session; find
+    // them by session id so they don't outlive the closed pane.
+    #[cfg(target_os = "linux")]
+    for member in session_members(pid as i32) {
+        // SAFETY: kill has no memory-safety preconditions; we only target our session.
+        unsafe {
+            libc::kill(member, libc::SIGKILL);
+        }
+    }
     #[cfg(not(unix))]
     {
         let _ = (pid, master);
     }
+}
+
+/// Parses the session id (field 6) from a `/proc/<pid>/stat` line. The command
+/// name is parenthesized and may itself contain spaces or `)`.
+#[cfg(target_os = "linux")]
+fn stat_session(stat: &str) -> Option<i32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After ')': state ppid pgrp session ...
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// Lists live pids whose session id is `sid` (excluding `sid` itself).
+#[cfg(target_os = "linux")]
+fn session_members(sid: i32) -> Vec<i32> {
+    if sid <= 1 {
+        return vec![];
+    }
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return vec![];
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|&p| p != sid)
+        .filter(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/stat"))
+                .ok()
+                .and_then(|s| stat_session(&s))
+                == Some(sid)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -353,6 +392,60 @@ mod tests {
     fn shell_resolution_always_yields_something() {
         assert!(!resolve_shell(None).is_empty());
         assert!(!resolve_shell(Some("relative/sh")).is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_session_from_proc_stat() {
+        assert_eq!(
+            stat_session("1234 (bash) S 1 1234 1234 34816 1234 4194560"),
+            Some(1234)
+        );
+        assert_eq!(stat_session("77 (we ird) name)) R 5 60 99 0 -1"), Some(99));
+        assert_eq!(stat_session("garbage"), None);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_job_in_session_is_killed() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        // A new session whose leader backgrounds a job (found via its session id).
+        let mut leader = Command::new("sh");
+        leader
+            .args(["-c", "sleep 300 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe and runs in the forked child only.
+        unsafe {
+            leader.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = leader.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let job: i32 = line.trim().parse().unwrap();
+        let sid = child.id() as i32;
+        assert!(session_members(sid).contains(&job));
+        assert!(!session_members(sid).contains(&sid));
+        // Killing session members alone (not the leader's group) reaches the job.
+        for p in session_members(sid) {
+            // SAFETY: test-owned processes.
+            unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::read_to_string(format!("/proc/{job}/stat"))
+                .map(|s| s.contains(") Z "))
+                .unwrap_or(true)
+        });
+        // SAFETY: test-owned process group.
+        unsafe { libc::kill(-sid, libc::SIGKILL) };
+        let _ = child.wait();
+        assert!(gone, "background job {job} survived");
     }
     #[test]
     fn instance_lock_is_exclusive() {
