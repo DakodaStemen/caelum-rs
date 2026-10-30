@@ -547,6 +547,27 @@ mod tests {
         assert!(first.is_some());
         assert!(lock_instance(&p).unwrap().is_none());
         drop(first);
-        assert!(lock_instance(&p).unwrap().is_some());
+        // flock belongs to the open file description. A sibling test thread that is
+        // between fork() and exec() (std::process / portable-pty) briefly holds a copy
+        // of our descriptor, so the release can lag by that window. Retry for a bound.
+        let relocked = (0..200).any(|_| {
+            lock_instance(&p).unwrap().is_some() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(relocked, "lock not released within 2s of drop");
+    }
+    /// The real guarantee behind the flake above: exec'd children (shells, panes) must
+    /// never inherit the lock, or a surviving shell would block relaunching the app.
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_fd_is_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        let d = tempfile::tempdir().unwrap();
+        let lock = lock_instance(&d.path().join("app.lock")).unwrap().unwrap();
+        // SAFETY: F_GETFD only reads flags of a descriptor we own.
+        let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "flags={flags}");
     }
 }
