@@ -860,14 +860,6 @@ pub fn show(
                         });
                         continue;
                     }
-                    if modifiers.ctrl
-                        && modifiers.shift
-                        && matches!(key, Key::ArrowUp | Key::ArrowDown)
-                    {
-                        // Needs OSC 133 shell integration; silently a no-op otherwise.
-                        s.jump_prompt(key == Key::ArrowDown);
-                        continue;
-                    }
                     if !(modifiers.ctrl && modifiers.shift)
                         && let Some(bytes) = key_bytes(key, modifiers, mode)
                     {

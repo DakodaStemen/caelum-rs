@@ -47,6 +47,8 @@ enum Action {
     Search,
     Copy,
     Paste,
+    PrevPrompt,
+    NextPrompt,
 }
 #[derive(Clone)]
 enum PendingClose {
@@ -450,6 +452,12 @@ impl App {
                 }
             }
             Action::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Action::PrevPrompt | Action::NextPrompt => {
+                // Needs OSC 133 shell integration; silently a no-op otherwise.
+                if let Some(s) = self.terminals.get_mut(&self.focused) {
+                    s.jump_prompt(matches!(action, Action::NextPrompt));
+                }
+            }
         }
         ctx.request_repaint();
     }
@@ -470,6 +478,8 @@ impl App {
             ("Launch Claude".into(), Action::Assistant("claude".into())),
             ("Toggle sidebar".into(), Action::Sidebar),
             ("Appearance and settings".into(), Action::Settings),
+            ("Previous prompt".into(), Action::PrevPrompt),
+            ("Next prompt".into(), Action::NextPrompt),
         ];
         for (id, t) in &self.presets {
             a.push((format!("Theme: {}", t.name), Action::Theme(id.clone())));
@@ -480,23 +490,7 @@ impl App {
         a
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let table = [
-            ("command_palette", Action::Palette),
-            ("toggle_sidebar", Action::Sidebar),
-            ("new_tab", Action::NewTab),
-            ("split_right", Action::Split(Axis::Horizontal)),
-            ("split_below", Action::Split(Axis::Vertical)),
-            ("zoom_pane", Action::Zoom),
-            ("close_pane", Action::ClosePane),
-            ("open_file", Action::Open),
-            ("save_file", Action::Save),
-            ("search", Action::Search),
-            ("next_tab", Action::NextTab),
-            ("prev_tab", Action::PrevTab),
-            ("copy", Action::Copy),
-            ("paste", Action::Paste),
-        ];
-        let mut bound: Vec<_> = table
+        let mut bound: Vec<_> = shortcut_table()
             .into_iter()
             .filter_map(|(name, a)| self.keymap.get(name).map(|b| (b, a)))
             .collect();
@@ -1044,6 +1038,28 @@ impl eframe::App for App {
         self.terminals.clear();
     }
 }
+/// Config action name -> app action for every rebindable shortcut in [`config::ACTIONS`].
+fn shortcut_table() -> Vec<(&'static str, Action)> {
+    vec![
+        ("command_palette", Action::Palette),
+        ("toggle_sidebar", Action::Sidebar),
+        ("new_tab", Action::NewTab),
+        ("split_right", Action::Split(Axis::Horizontal)),
+        ("split_below", Action::Split(Axis::Vertical)),
+        ("zoom_pane", Action::Zoom),
+        ("close_pane", Action::ClosePane),
+        ("open_file", Action::Open),
+        ("save_file", Action::Save),
+        ("search", Action::Search),
+        ("next_tab", Action::NextTab),
+        ("prev_tab", Action::PrevTab),
+        ("copy", Action::Copy),
+        ("paste", Action::Paste),
+        ("prev_prompt", Action::PrevPrompt),
+        ("next_prompt", Action::NextPrompt),
+    ]
+}
+
 fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
     if root.id() == id {
         *root = replacement;
@@ -1053,5 +1069,22 @@ fn update_node(root: &mut Pane, id: &str, replacement: Pane) {
         } else {
             update_node(second, id, replacement);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_configurable_action_is_dispatched() {
+        let wired: Vec<&str> = shortcut_table().into_iter().map(|(n, _)| n).collect();
+        for (name, _) in config::ACTIONS {
+            assert!(wired.contains(name), "{name} has no dispatch entry");
+        }
+        assert_eq!(wired.len(), config::ACTIONS.len());
+        let k = Keymap::default();
+        assert_eq!(k.get("prev_prompt").unwrap().key, Key::ArrowUp);
+        assert_eq!(k.get("next_prompt").unwrap().key, Key::ArrowDown);
     }
 }
