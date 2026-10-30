@@ -126,32 +126,60 @@ impl FileView {
     }
 }
 struct SystemInfo {
-    updated: Instant,
+    updated: Option<Instant>,
     load: String,
     memory: String,
     uptime: String,
     processes: Vec<(String, String, String)>,
+    /// The snapshot being taken on a background thread, if any.
+    snapshot: Option<std::sync::mpsc::Receiver<caelum_rs::platform::SystemSnapshot>>,
 }
 impl SystemInfo {
     fn new() -> Self {
         Self {
-            updated: Instant::now() - Duration::from_secs(10),
+            updated: None,
             load: String::new(),
             memory: String::new(),
             uptime: String::new(),
             processes: vec![],
+            snapshot: None,
         }
     }
-    fn refresh(&mut self) {
-        if self.updated.elapsed() < Duration::from_secs(2) {
+    /// Takes in a finished snapshot and starts the next one (at most one in flight,
+    /// at most every two seconds). Reading /proc never runs on the UI thread.
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.snapshot {
+            match rx.try_recv() {
+                Ok(snap) => {
+                    self.load = snap.load;
+                    self.memory = snap.memory;
+                    self.uptime = snap.uptime;
+                    self.processes = snap.processes;
+                    self.snapshot = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.snapshot = None,
+            }
+        }
+        if self
+            .updated
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+        {
             return;
         }
-        self.updated = Instant::now();
-        let snap = caelum_rs::platform::system_snapshot();
-        self.load = snap.load;
-        self.memory = snap.memory;
-        self.uptime = snap.uptime;
-        self.processes = snap.processes;
+        self.updated = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        if std::thread::Builder::new()
+            .name("caelum-system".into())
+            .spawn(move || {
+                let _ = tx.send(caelum_rs::platform::system_snapshot());
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.snapshot = Some(rx);
+        }
     }
 }
 pub struct App {
@@ -907,17 +935,20 @@ impl App {
                     self.action(Action::System, ctx);
                 }
                 7 => {
-                    self.system.refresh();
+                    // The snapshot arrives from a background thread; the overall
+                    // timeout reports a view that never fills.
+                    self.system.refresh(ctx);
                     if self.system.memory.is_empty() {
-                        bail!("System view missing");
+                        return Ok(false);
                     }
                     s.checks
                         .push("System view reads live memory and uptime".into());
                     self.action(Action::Processes, ctx);
                 }
                 8 => {
+                    self.system.refresh(ctx);
                     if self.system.processes.is_empty() {
-                        bail!("No processes shown");
+                        return Ok(false);
                     }
                     s.checks.push("Process viewer lists live processes".into());
                     self.action(Action::Theme("lunar".into()), ctx);

@@ -269,7 +269,7 @@ impl App {
         }
     }
     pub(super) fn system_pane(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        self.system.refresh();
+        self.system.refresh(ui.ctx());
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(16.);
             for (name, value) in [
@@ -289,7 +289,7 @@ impl App {
         });
     }
     pub(super) fn processes_pane(&mut self, ui: &mut egui::Ui, id: &str) {
-        self.system.refresh();
+        self.system.refresh(ui.ctx());
         ui.add(
             egui::TextEdit::singleline(&mut self.process_filter).hint_text("Filter name or PID…"),
         );
