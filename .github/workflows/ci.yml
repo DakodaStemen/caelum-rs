@@ -19,10 +19,15 @@ jobs:
         with:
           cache-on-failure: true
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig vim-tiny
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxtst-dev xvfb fontconfig vim-tiny zsh fish
+      - name: Install fish on macOS (zsh is preinstalled)
+        if: runner.os == 'macOS'
+        run: brew install fish
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+        env:
+          CAELUM_REQUIRE_SHELLS: ${{ runner.os != 'Windows' && '1' || '0' }}
       - name: Desktop tests under Xvfb
         if: runner.os == 'Linux'
         run: xvfb-run -a -s "-screen 0 1600x1000x24" cargo test --locked --test desktop -- --ignored --nocapture
